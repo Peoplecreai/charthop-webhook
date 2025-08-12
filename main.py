@@ -433,10 +433,15 @@ def nightly():
     return "ok", 200
 
 
-@app.route("/", methods=["GET"])
-def health():
-    return "OK", 200
-
+@app.route("/", methods=["GET", "POST"])
+def root():
+    if request.method == "GET":
+        return "OK", 200
+    # Detecta si el POST viene de Teamtailor o de ChartHop y reusa tus handlers
+    payload = request.get_json(force=True, silent=True) or {}
+    if request.headers.get("Teamtailor-Signature") or "resource_id" in payload:
+        return tt_webhook()       # Teamtailor
+    return ch_webhook()   
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
