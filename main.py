@@ -436,6 +436,10 @@ def nightly():
         print("Culture Amp SFTP error:", e)
     return "ok", 200
 
+@app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
+
 if __name__ == "__main__":
     # Para pruebas locales
     app.run(host="0.0.0.0", port=8080)
