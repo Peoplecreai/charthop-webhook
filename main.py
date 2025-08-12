@@ -1,4 +1,4 @@
-import os, io, csv, hmac, hashlib, base64, datetime as dt, unicodedata
+import os, io, csv, hmac, hashlib, base64, datetime as dt, unicodedata, socket
 from flask import Flask, request, abort
 import requests
 import paramiko
@@ -172,7 +172,7 @@ def runn_create_leave(person_id, starts_at, ends_at, reason="Vacation", external
     r.raise_for_status(); return r.json()
 
 # =========================
-# Export nocturno a Culture Amp
+# Export nocturno a Culture Amp (v2/person con paginación)
 # =========================
 def build_ca_csv_from_charthop():
     """
@@ -181,7 +181,6 @@ def build_ca_csv_from_charthop():
     Job Title, Seniority, Locale, Timezone
     Solo usa work email. Si no hay, omite la fila.
     """
-    # Paginación defensiva sobre /v2/person
     url = f"{CH_API}/v2/org/{CH_ORG_ID}/person"
     fields = ",".join([
         "person id",
@@ -189,7 +188,7 @@ def build_ca_csv_from_charthop():
         "name last",
         "preferred name first",
         "contact workemail",
-        "contact personalemail",
+        "contact personalemail",   # personal se ignora aquí
         "manager contact workemail",
         "title",
         "seniority",
@@ -197,7 +196,6 @@ def build_ca_csv_from_charthop():
         "homeaddress region",
         "status",
     ])
-
     rows = []
     limit = 200
     offset = 0
@@ -214,7 +212,7 @@ def build_ca_csv_from_charthop():
         for it in items:
             f = it.get("fields") or {}
 
-            # Si quieres solo activos, filtra aquí
+            # filtra a activos si el campo existe
             status = (f.get("status") or "").strip().lower()
             if status and status not in ("active", "current", "enabled"):
                 continue
@@ -226,8 +224,7 @@ def build_ca_csv_from_charthop():
 
             work = f.get("contact workemail") or ""
             if not work:
-                # No subimos a CA si no hay correo corporativo
-                continue
+                continue  # no subimos a CA si no hay corporativo
 
             manager_email = f.get("manager contact workemail") or ""
             country = f.get("homeaddress country") or ""
@@ -260,6 +257,46 @@ def build_ca_csv_from_charthop():
     for rw in rows:
         w.writerow(rw)
     return sio.getvalue()
+
+# =========================
+# SFTP con timeouts y soporte Ed25519/RSA
+# =========================
+def sftp_upload(host: str, username: str, password: str = None, pkey_pem: str = None,
+                remote_path: str = "/upload/employee_import.csv", content: str = "") -> None:
+    """Sube un archivo por SFTP con timeouts defensivos."""
+    # 1) socket con timeout duro de 15s al conectar
+    sock = socket.create_connection((host, 22), timeout=15)
+
+    # 2) Transport sobre ese socket y menos paciencia en el banner
+    transport = paramiko.Transport(sock)
+    transport.banner_timeout = 15  # handshake/bienvenida
+
+    # 3) Autenticación: llave (Ed25519 o RSA) o password
+    if pkey_pem:
+        buf = io.StringIO(pkey_pem)
+        key = None
+        try:
+            key = paramiko.Ed25519Key.from_private_key(buf, password=CA_SFTP_PASSPHRASE)
+        except Exception:
+            buf.seek(0)
+            key = paramiko.RSAKey.from_private_key(buf, password=CA_SFTP_PASSPHRASE)
+        transport.connect(username=username, pkey=key)
+    else:
+        if not password:
+            raise RuntimeError("SFTP necesita CA_SFTP_KEY o CA_SFTP_PASS")
+        transport.connect(username=username, password=password)
+
+    # 4) SFTP y escritura
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    try:
+        with sftp.file(remote_path, "w") as f:
+            f.write(content)
+            f.flush()
+    finally:
+        try:
+            sftp.close()
+        finally:
+            transport.close()
 
 # =========================
 # Webhooks
@@ -400,5 +437,5 @@ def nightly():
     return "ok", 200
 
 if __name__ == "__main__":
-    # Para pruebas locales. En Cloud Run te arranca gunicorn automáticamente.
+    # Para pruebas locales
     app.run(host="0.0.0.0", port=8080)
