@@ -181,73 +181,85 @@ def build_ca_csv_from_charthop():
     Job Title, Seniority, Locale, Timezone
     Solo usa work email. Si no hay, omite la fila.
     """
-    url = f"{CH_API}/v2/org/{CH_ORG_ID}/job"
-    params = {
-        "q": "open\\filled",
-        "fields": ",".join([
-            "jobId","person id","name first","name last","preferred name first",
-            "contact workemail","contact personalemail",   # personal se ignora aquí
-            "manager contact workemail","title","seniority",
-            "homeaddress country","homeaddress region",
-        ])
-    }
-    r = requests.get(url, headers=ch_headers(), params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
+    # Paginación defensiva sobre /v2/person
+    url = f"{CH_API}/v2/org/{CH_ORG_ID}/person"
+    fields = ",".join([
+        "person id",
+        "name first",
+        "name last",
+        "preferred name first",
+        "contact workemail",
+        "contact personalemail",
+        "manager contact workemail",
+        "title",
+        "seniority",
+        "homeaddress country",
+        "homeaddress region",
+        "status",
+    ])
+
     rows = []
-    for item in (r.json() or {}).get("data", []):
-        f = item.get("fields") or {}
-        first_pref = f.get("preferred name first") or ""
-        first = first_pref or f.get("name first") or ""
-        last = f.get("name last") or ""
-        name = f"{first} {last}".strip() if first or last else ""
-        work = f.get("contact workemail") or ""
-        if not work:
-            continue
-        manager_email = f.get("manager contact workemail") or ""
-        country = f.get("homeaddress country") or ""
-        region = f.get("homeaddress region") or ""
-        locale, tz = derive_locale_timezone(country)
-        location = compose_location(region, country)
-        employee_id = f.get("person id") or work
-        rows.append({
-            "Employee Id": employee_id,
-            "Email": work,
-            "Name": name,
-            "Preferred Name": first_pref or "",
-            "Manager Email": manager_email,
-            "Location": location,
-            "Job Title": f.get("title") or "",
-            "Seniority": f.get("seniority") or "",
-            "Locale": locale,
-            "Timezone": tz,
-        })
+    limit = 200
+    offset = 0
+
+    while True:
+        params = {"fields": fields, "limit": limit, "offset": offset}
+        r = requests.get(url, headers=ch_headers(), params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json() or {}
+        items = data.get("data") or []
+        if not items:
+            break
+
+        for it in items:
+            f = it.get("fields") or {}
+
+            # Si quieres solo activos, filtra aquí
+            status = (f.get("status") or "").strip().lower()
+            if status and status not in ("active", "current", "enabled"):
+                continue
+
+            first_pref = f.get("preferred name first") or ""
+            first = first_pref or f.get("name first") or ""
+            last = f.get("name last") or ""
+            name = f"{first} {last}".strip() if first or last else ""
+
+            work = f.get("contact workemail") or ""
+            if not work:
+                # No subimos a CA si no hay correo corporativo
+                continue
+
+            manager_email = f.get("manager contact workemail") or ""
+            country = f.get("homeaddress country") or ""
+            region = f.get("homeaddress region") or ""
+            locale, tz = derive_locale_timezone(country)
+            location = compose_location(region, country)
+
+            employee_id = f.get("person id") or work
+
+            rows.append({
+                "Employee Id": employee_id,
+                "Email": work,
+                "Name": name,
+                "Preferred Name": first_pref or "",
+                "Manager Email": manager_email,
+                "Location": location,
+                "Job Title": f.get("title") or "",
+                "Seniority": f.get("seniority") or "",
+                "Locale": locale,
+                "Timezone": tz,
+            })
+
+        offset += len(items)
+
     cols = ["Employee Id","Email","Name","Preferred Name","Manager Email",
             "Location","Job Title","Seniority","Locale","Timezone"]
-    sio = io.StringIO(); w = csv.DictWriter(sio, fieldnames=cols, extrasaction="ignore")
-    w.writeheader(); [w.writerow(rw) for rw in rows]
+    sio = io.StringIO()
+    w = csv.DictWriter(sio, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    for rw in rows:
+        w.writerow(rw)
     return sio.getvalue()
-
-def sftp_upload(host, username, password=None, pkey_pem=None, remote_path="/upload/employee_import.csv", content=""):
-    """
-    Soporta Ed25519 y RSA. pkey_pem debe ser la privada PEM (desde Secret).
-    """
-    key = None
-    if pkey_pem:
-        buf = io.StringIO(pkey_pem)
-        try:
-            key = paramiko.Ed25519Key.from_private_key(buf, password=CA_SFTP_PASSPHRASE)
-        except Exception:
-            buf.seek(0)
-            key = paramiko.RSAKey.from_private_key(buf, password=CA_SFTP_PASSPHRASE)
-    transport = paramiko.Transport((host, 22))
-    if key:
-        transport.connect(username=username, pkey=key)
-    else:
-        transport.connect(username=username, password=password)
-    sftp = paramiko.SFTPClient.from_transport(transport)
-    with sftp.file(remote_path, "w") as f:
-        f.write(content)
-    sftp.close(); transport.close()
 
 # =========================
 # Webhooks
