@@ -314,3 +314,79 @@ def tt_webhook():
                 employment_type="employee",
                 starts_at=start_date
             )
+        else:
+            print("Runn upsert skip: no corporate email")
+    except Exception as e:
+        print("Runn upsert error:", e)
+
+    return "", 200
+
+@app.route("/webhooks/charthop", methods=["POST", "GET"])
+def ch_webhook():
+    if request.method == "GET":
+        return "ChartHop webhook up", 200
+
+    evt = request.get_json(force=True, silent=True) or {}
+    evtype = evt.get("type", "")
+    entity = evt.get("entitytype", "")
+    entity_id = evt.get("entityid")
+
+    # Ejemplo: crear Job en Teamtailor cuando ChartHop crea job
+    if entity == "job" and evtype in ("job.create",):
+        job = ch_find_job(str(entity_id))
+        if job:
+            payload = {
+                "data": {
+                    "type": "jobs",
+                    "attributes": {
+                        "title": job.get("title") or "Untitled",
+                        "body": "Created from ChartHop",
+                        "status": "unlisted"
+                    }
+                }
+            }
+            try:
+                r = requests.post(f"{TT_API}/jobs", headers=tt_headers(), json=payload, timeout=HTTP_TIMEOUT)
+                print("TT job create status:", r.status_code, str(r.text)[:300])
+            except Exception as e:
+                print("TT job create error:", e)
+
+    return "", 200
+
+# =========================
+# Multiplexor de raíz (ChartHop obliga a POST "/")
+# =========================
+@app.route("/", methods=["GET", "POST"])
+def root():
+    if request.method == "GET":
+        return "OK", 200
+    payload = request.get_json(force=True, silent=True) or {}
+    # Si trae firma/shape de Teamtailor
+    if request.headers.get("Teamtailor-Signature") or "resource_id" in payload:
+        return tt_webhook()
+    # Por defecto, tratamos como ChartHop
+    return ch_webhook()
+
+# =========================
+# Cron nocturno: CSV -> Culture Amp por SFTP
+# =========================
+@app.route("/cron/nightly", methods=["GET"])
+def nightly():
+    try:
+        csv_text = build_ca_csv_from_charthop()
+        fname = f"{CA_SFTP_PATH.rstrip('/')}/employees_{dt.date.today().isoformat()}.csv"
+        sftp_upload(
+            host=CA_SFTP_HOST,
+            username=CA_SFTP_USER,
+            password=CA_SFTP_PASS,
+            pkey_pem=CA_SFTP_KEY,
+            remote_path=fname,
+            content=csv_text
+        )
+    except Exception as e:
+        print("Culture Amp SFTP error:", e)
+    return "ok", 200
+
+if __name__ == "__main__":
+    # Para pruebas locales. En Cloud Run te arranca gunicorn automáticamente.
+    app.run(host="0.0.0.0", port=8080)
