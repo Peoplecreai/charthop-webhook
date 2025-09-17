@@ -30,7 +30,7 @@ CA_SFTP_PATH = os.getenv("CA_SFTP_PATH", "/upload")
 
 # Custom fields para enlazar vacantes
 TT_CF_JOB_CH_ID = os.getenv("TT_CF_JOB_CH_ID")  # id del custom field en Teamtailor
-TT_CF_JOB_CH_API_NAME = os.getenv("TT_CF_JOB_CH_API_NAME", "charthop_job_id")
+TT_CF_JOB_CH_API_NAME = os.getenv("TT_CF_JOB_CH_API_NAME", "charthop-job-id")
 CH_CF_JOB_TT_ID_LABEL = os.getenv("CH_CF_JOB_TT_ID_LABEL", "teamtailorJobid")  # etiqueta visible en CH
 
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "es-LA")
