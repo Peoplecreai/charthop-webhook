@@ -124,12 +124,22 @@ def _has_key(d: dict, *keys) -> bool:
 # ChartHop helpers
 # =========================
 def ch_find_job(job_id: str):
+    """Busca un Job por jobid usando el endpoint y q=jobid\{id} (doc oficial)."""
     url = f"{CH_API}/v2/org/{CH_ORG_ID}/job"
-    params = {"q": f"jobid\\{job_id}", "fields": "title,department name,location name,open"}
-    r = requests.get(url, headers=ch_headers(), params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    items = (r.json() or {}).get("data") or []
-    return items[0] if items else None
+    params = {
+        "q": f"jobid\\{job_id}",  # ChartHop carrot filter: field\value
+        "fields": "title,department name,location name,open"
+    }
+    try:
+        r = requests.get(url, headers=ch_headers(), params=params, timeout=HTTP_TIMEOUT)
+        if r.status_code == 200:
+            items = (r.json() or {}).get("data") or []
+            return items[0] if items else None
+        # log útil para diagnosticar permisos/sintaxis
+        print("ch_find_job status:", r.status_code, (r.text or "")[:300])
+    except Exception as e:
+        print("ch_find_job error:", e)
+    return None
 
 def ch_email_exists(email: str) -> bool:
     if not email: return False
