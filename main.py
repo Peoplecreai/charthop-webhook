@@ -416,84 +416,12 @@ def sftp_upload(host: str, username: str, password: str = None, pkey_pem: str = 
 # =========================
 # Webhooks
 # =========================
-@app.route("/webhooks/teamtailor", methods=["POST"])
-def tt_webhook():
-    payload = request.get_json(force=True, silent=True) or {}
-    tt_verify_signature(payload)
-
-    resource_id = payload.get("resource_id") or payload.get("id")
-    if not resource_id:
-        return "", 200
-
-    try:
-        resp = requests.get(
-            f"{TT_API}/job-applications/{resource_id}?include=candidate,job",
-            headers=tt_headers(), timeout=HTTP_TIMEOUT
-        )
-    except Exception as e:
-        print("TT fetch error:", e); return "", 200
-    if not resp.ok:
-        print("TT fetch non-OK:", resp.status_code, resp.text[:300])
-        return "", 200
-
-    body = resp.json() or {}
-    data = body.get("data") or {}
-    attributes = data.get("attributes") or {}
-    status = (attributes.get("status") or attributes.get("state") or "").lower()
-    hired_at = attributes.get("hired-at") or attributes.get("hired_at")
-    if status != "hired" and not hired_at:
-        return "", 200
-
-    included = body.get("included") or []
-    candidate = next((i for i in included if i.get("type") == "candidates"), {}) or {}
-    job = next((i for i in included if i.get("type") == "jobs"), {}) or {}
-
-    cand_attr = candidate.get("attributes") or {}
-    job_attr = job.get("attributes") or {}
-
-    first = cand_attr.get("first-name") or cand_attr.get("first_name") or ""
-    last = cand_attr.get("last-name") or cand_attr.get("last_name") or ""
-    personal_email = cand_attr.get("email") or ""
-    title = job_attr.get("title") or ""
-    start_date = attributes.get("start-date") or attributes.get("start_date") or (hired_at or "")[:10]
-
-    work_email = generate_unique_work_email(first, last)
-
-    # 1) ChartHop: alta vía import CSV
-    rows = [{
-        "contact personalemail": personal_email,
-        **({"contact workemail": work_email} if work_email else {}),
-        "first name": first, "last name": last,
-        "title": title, "start date": start_date
-    }]
-    try:
-        ch_import_people_csv(rows)
-    except Exception as e:
-        print("ChartHop import error:", e)
-
-    # 2) Runn
-    try:
-        if work_email:
-            runn_upsert_person(
-                name=f"{first} {last}".strip(),
-                email=work_email,
-                employment_type="employee",
-                starts_at=start_date
-            )
-        else:
-            print("Runn upsert skip: no corporate email")
-    except Exception as e:
-        print("Runn upsert error:", e)
-
-    return "", 200
-
 @app.route("/webhooks/charthop", methods=["POST", "GET"])
 def ch_webhook():
     if request.method == "GET":
         return "ChartHop webhook up", 200
 
     evt = request.get_json(force=True, silent=True) or {}
-    # parseo tolerante de llaves
     evtype = _evt_get(evt, "type", "eventType", "event_type") or ""
     entity = _evt_get(evt, "entityType", "entitytype", "entity_type") or ""
     entity_id = str(_evt_get(evt, "entityId", "entityid", "entity_id") or "")
@@ -505,10 +433,19 @@ def ch_webhook():
     is_create = evtype.lower() in ("job.create", "job_create", "create")
     is_update = evtype.lower() in ("job.update", "job_update", "update", "change")
 
-    # crear Job en Teamtailor cuando CH crea un Job
     if is_job and is_create:
-        job = ch_find_job(entity_id)
-        if job:
+        try:
+            if not entity_id:
+                print("CH job create: missing entity_id")
+                return "", 200
+
+            # 1) Buscar el job en CH (puede dar 404/401 -> lo capturamos)
+            job = ch_find_job(entity_id)
+            if not job:
+                print(f"CH job create: job {entity_id} not found in CH")
+                return "", 200
+
+            # 2) Crear job en TT
             payload = {
                 "data": {
                     "type": "jobs",
@@ -519,32 +456,35 @@ def ch_webhook():
                     }
                 }
             }
-            try:
-                r = requests.post(f"{TT_API}/jobs", headers=tt_headers(), json=payload, timeout=HTTP_TIMEOUT)
-                print("TT job create status:", r.status_code, str(r.text)[:300])
-                r.raise_for_status()
-                tt_job_json = r.json() or {}
-                tt_job_id = ((tt_job_json.get("data") or {}).get("id") or "").strip()
-                if tt_job_id:
-                    # Persistir vínculo en TT: charthop_job_id
-                    try:
-                        tt_upsert_job_custom_field(tt_job_id, entity_id)
-                    except Exception as e:
-                        print("TT set charthop_job_id error:", e)
-                    # Persistir vínculo espejo en CH: teamtailorJobid
-                    try:
-                        ch_upsert_job_field(entity_id, CH_CF_JOB_TT_ID_LABEL, tt_job_id)
-                    except Exception as e:
-                        print("CH set teamtailorJobid error:", e)
-            except Exception as e:
-                print("TT job create error:", e)
+            r = requests.post(f"{TT_API}/jobs", headers=tt_headers(), json=payload, timeout=HTTP_TIMEOUT)
+            print("TT job create status:", r.status_code, str(r.text)[:300])
+            r.raise_for_status()
 
-    # opcional: loguear updates para referencia
+            # 3) Leer id y enlazar IDs
+            tt_job_json = r.json() or {}
+            tt_job_id = ((tt_job_json.get("data") or {}).get("id") or "").strip()
+            if tt_job_id:
+                try:
+                    tt_upsert_job_custom_field(tt_job_id, entity_id)  # TT: charthop-job-id
+                except Exception as e:
+                    print("TT set charthop_job_id error:", e)
+                try:
+                    ch_upsert_job_field(entity_id, CH_CF_JOB_TT_ID_LABEL, tt_job_id)  # CH: teamtailorJobid
+                except Exception as e:
+                    print("CH set teamtailorJobid error:", e)
+
+        except Exception as e:
+            # Capturamos TODO para no devolver 500 a ChartHop
+            print("CH job create handler error:", repr(e))
+
+        return "", 200
+
     elif is_job and is_update:
         print(f"CH job update ignored (entity_id={entity_id})")
+        return "", 200
 
+    # Otros eventos CH
     return "", 200
-
 
 # =========================
 # Multiplexor raíz
