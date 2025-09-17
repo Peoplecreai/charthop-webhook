@@ -14,7 +14,7 @@ CH_API_TOKEN = os.getenv("CH_API_TOKEN")
 
 TT_API = os.getenv("TT_API", "https://api.teamtailor.com/v1")
 TT_API_KEY = os.getenv("TT_API_KEY") or os.getenv("TEAMTAILOR_API_KEY")
-TT_API_VERSION = os.getenv("TT_API_VERSION", "20240404")  # usa una versión estable
+TT_API_VERSION = os.getenv("TT_API_VERSION", "20240404")
 TT_SIGNATURE_KEY = os.getenv("TT_SIGNATURE_KEY")
 
 RUNN_API = os.getenv("RUNN_API", "https://api.runn.io")
@@ -23,15 +23,15 @@ RUNN_API_VERSION = os.getenv("RUNN_API_VERSION", "1.0.0")
 
 CA_SFTP_HOST = os.getenv("CA_SFTP_HOST")
 CA_SFTP_USER = os.getenv("CA_SFTP_USER")
-CA_SFTP_PASS = os.getenv("CA_SFTP_PASS")                   # si usas password
-CA_SFTP_KEY = os.getenv("CA_SFTP_KEY")                     # privada PEM (Secret)
-CA_SFTP_PASSPHRASE = os.getenv("CA_SFTP_PASSPHRASE")       # opcional
+CA_SFTP_PASS = os.getenv("CA_SFTP_PASS")
+CA_SFTP_KEY = os.getenv("CA_SFTP_KEY")
+CA_SFTP_PASSPHRASE = os.getenv("CA_SFTP_PASSPHRASE")
 CA_SFTP_PATH = os.getenv("CA_SFTP_PATH", "/upload")
 
-# Custom fields (en TT y CH) para enlazar vacantes
-TT_CF_JOB_CH_ID = os.getenv("TT_CF_JOB_CH_ID")             # id del custom field en Teamtailor (recomendado)
-TT_CF_JOB_CH_API_NAME = os.getenv("TT_CF_JOB_CH_API_NAME", "charthop_job_id")  # fallback por api-name
-CH_CF_JOB_TT_ID_LABEL = os.getenv("CH_CF_JOB_TT_ID_LABEL", "teamtailorJobid")  # etiqueta visible del field en CH
+# Custom fields para enlazar vacantes
+TT_CF_JOB_CH_ID = os.getenv("TT_CF_JOB_CH_ID")  # id del custom field en Teamtailor
+TT_CF_JOB_CH_API_NAME = os.getenv("TT_CF_JOB_CH_API_NAME", "charthop_job_id")
+CH_CF_JOB_TT_ID_LABEL = os.getenv("CH_CF_JOB_TT_ID_LABEL", "teamtailorJobid")  # etiqueta visible en CH
 
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "es-LA")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "UTC")
@@ -63,7 +63,7 @@ def runn_headers():
 # Helpers generales
 # =========================
 def tt_verify_signature(payload: dict):
-    # Teamtailor: HMAC-SHA256(resource_id) -> hex -> base64 (si configuras TT_SIGNATURE_KEY)
+    # HMAC-SHA256(resource_id) -> hex -> base64, si TT_SIGNATURE_KEY está seteada
     if not TT_SIGNATURE_KEY:
         return True
     provided = request.headers.get("Teamtailor-Signature", "")
@@ -99,6 +99,26 @@ def compose_location(state_or_city: str, country_code: str):
     if state and cc: return f"{state}, {cc}"
     if cc: return cc
     return ""
+
+def _evt_get(d: dict, *keys):
+    """Obtiene d[key] tolerando casing y variantes."""
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if k in d:
+            return d[k]
+    dl = { (k or "").lower(): v for k, v in d.items() }
+    for k in keys:
+        v = dl.get((k or "").lower())
+        if v is not None:
+            return v
+    return None
+
+def _has_key(d: dict, *keys) -> bool:
+    if not isinstance(d, dict):
+        return False
+    lower = { (k or "").lower() for k in d.keys() }
+    return any(((k in d) or (k.lower() in lower)) for k in keys)
 
 # =========================
 # ChartHop helpers
@@ -150,10 +170,7 @@ def ch_import_people_csv(rows):
     return r.json()
 
 def ch_upsert_job_field(job_id: str, field_label: str, value: str):
-    """
-    Actualiza un campo custom de Job en ChartHop vía import CSV (forma estable).
-    field_label debe coincidir con la etiqueta visible del campo en CH.
-    """
+    """Actualiza un campo custom de Job en CH vía import CSV."""
     sio = io.StringIO()
     w = csv.DictWriter(sio, fieldnames=["job id", field_label])
     w.writeheader()
@@ -205,7 +222,6 @@ def tt_upsert_job_custom_field(job_id: str, value: str,
     if not cf_id:
         raise RuntimeError("No se pudo resolver el ID del custom field de Teamtailor")
 
-    # Intento de POST; si ya existe valor, hacemos PATCH
     payload = {
         "data": {
             "type": "custom-field-values",
@@ -221,7 +237,6 @@ def tt_upsert_job_custom_field(job_id: str, value: str,
     if r.status_code in (200, 201):
         return r.json()
 
-    # Si ya existe, buscamos el ID y hacemos PATCH
     cfv_id = tt_find_job_custom_field_value_id(job_id, cf_id)
     if cfv_id:
         patch = {
@@ -279,39 +294,23 @@ def runn_upsert_person(name, email, role_id=None, team_id=None, employment_type=
     r.raise_for_status()
 
 def runn_create_leave(person_id, starts_at, ends_at, reason="Vacation", external_ref=None):
-    payload = {"personId": person_id, "startsAt": starts_at, "endsAt": ends_at, "reason": reason}
+    payload = {"personId": person_id, "startsAt": starts_at, "EndsAt": ends_at, "reason": reason}
     if external_ref: payload["externalRef"] = external_ref
     r = requests.post(f"{RUNN_API}/time-offs/leave", headers=runn_headers(), json=payload, timeout=HTTP_TIMEOUT)
     r.raise_for_status(); return r.json()
 
 # =========================
-# Export nocturno a Culture Amp (v2/person con paginación)
+# Export nocturno a Culture Amp
 # =========================
 def build_ca_csv_from_charthop():
-    """
-    CSV para Culture Amp:
-    Employee Id, Email, Name, Preferred Name, Manager Email, Location,
-    Job Title, Seniority, Locale, Timezone
-    Solo usa work email. Si no hay, omite la fila.
-    """
     url = f"{CH_API}/v2/org/{CH_ORG_ID}/person"
     fields = ",".join([
-        "person id",
-        "name first",
-        "name last",
-        "preferred name first",
-        "contact workemail",
-        "contact personalemail",   # personal se ignora aquí
-        "manager contact workemail",
-        "title",
-        "seniority",
-        "homeaddress country",
-        "homeaddress region",
-        "status",
+        "person id","name first","name last","preferred name first",
+        "contact workemail","contact personalemail",
+        "manager contact workemail","title","seniority",
+        "homeaddress country","homeaddress region","status",
     ])
-    rows = []
-    limit = 200
-    offset = 0
+    rows, limit, offset = [], 200, 0
 
     while True:
         params = {"fields": fields, "limit": limit, "offset": offset}
@@ -324,8 +323,6 @@ def build_ca_csv_from_charthop():
 
         for it in items:
             f = it.get("fields") or {}
-
-            # filtra a activos si el campo existe
             status = (f.get("status") or "").strip().lower()
             if status and status not in ("active", "current", "enabled"):
                 continue
@@ -334,17 +331,15 @@ def build_ca_csv_from_charthop():
             first = first_pref or f.get("name first") or ""
             last = f.get("name last") or ""
             name = f"{first} {last}".strip() if first or last else ""
-
             work = f.get("contact workemail") or ""
             if not work:
-                continue  # no subimos a CA si no hay corporativo
+                continue
 
             manager_email = f.get("manager contact workemail") or ""
             country = f.get("homeaddress country") or ""
             region = f.get("homeaddress region") or ""
             locale, tz = derive_locale_timezone(country)
             location = compose_location(region, country)
-
             employee_id = f.get("person id") or work
 
             rows.append({
@@ -359,7 +354,6 @@ def build_ca_csv_from_charthop():
                 "Locale": locale,
                 "Timezone": tz,
             })
-
         offset += len(items)
 
     cols = ["Employee Id","Email","Name","Preferred Name","Manager Email",
@@ -375,7 +369,6 @@ def build_ca_csv_from_charthop():
 # SFTP con timeouts y soporte Ed25519/RSA
 # =========================
 def _sftp_ensure_dirs(sftp: paramiko.SFTPClient, remote_dir: str):
-    # Crea directorios intermedios si no existen (mkdir -p)
     if not remote_dir or remote_dir == "/":
         return
     parts = []
@@ -389,15 +382,10 @@ def _sftp_ensure_dirs(sftp: paramiko.SFTPClient, remote_dir: str):
 
 def sftp_upload(host: str, username: str, password: str = None, pkey_pem: str = None,
                 remote_path: str = "/upload/employee_import.csv", content: str = "") -> None:
-    """Sube un archivo por SFTP con timeouts defensivos."""
-    # 1) socket con timeout duro de 15s al conectar
     sock = socket.create_connection((host, 22), timeout=15)
-
-    # 2) Transport sobre ese socket y menos paciencia en el banner
     transport = paramiko.Transport(sock)
-    transport.banner_timeout = 15  # handshake/bienvenida
+    transport.banner_timeout = 15
 
-    # 3) Autenticación: llave (Ed25519 o RSA) o password
     if pkey_pem:
         buf = io.StringIO(pkey_pem)
         key = None
@@ -412,7 +400,6 @@ def sftp_upload(host: str, username: str, password: str = None, pkey_pem: str = 
             raise RuntimeError("SFTP necesita CA_SFTP_KEY o CA_SFTP_PASS")
         transport.connect(username=username, password=password)
 
-    # 4) SFTP y escritura binaria
     sftp = paramiko.SFTPClient.from_transport(transport)
     try:
         remote_dir = os.path.dirname(remote_path) or "/"
@@ -466,15 +453,15 @@ def tt_webhook():
 
     first = cand_attr.get("first-name") or cand_attr.get("first_name") or ""
     last = cand_attr.get("last-name") or cand_attr.get("last_name") or ""
-    personal_email = cand_attr.get("email") or ""  # solo se guarda en ChartHop
+    personal_email = cand_attr.get("email") or ""
     title = job_attr.get("title") or ""
     start_date = attributes.get("start-date") or attributes.get("start_date") or (hired_at or "")[:10]
 
     work_email = generate_unique_work_email(first, last)
 
-    # 1) ChartHop: personal email SOLO aquí + work email definitivo
+    # 1) ChartHop: alta vía import CSV
     rows = [{
-        "contact personalemail": personal_email,            # etiqueta completa para evitar campos ambiguos
+        "contact personalemail": personal_email,
         **({"contact workemail": work_email} if work_email else {}),
         "first name": first, "last name": last,
         "title": title, "start date": start_date
@@ -484,7 +471,7 @@ def tt_webhook():
     except Exception as e:
         print("ChartHop import error:", e)
 
-    # 2) Runn: SOLO work email
+    # 2) Runn
     try:
         if work_email:
             runn_upsert_person(
@@ -498,10 +485,6 @@ def tt_webhook():
     except Exception as e:
         print("Runn upsert error:", e)
 
-    # 3) Si necesitas saber el job de CH desde TT más adelante:
-    # tt_job_id = job.get("id") or ""
-    # ch_job_id = tt_get_job_charthop_id(tt_job_id) if tt_job_id else None
-
     return "", 200
 
 @app.route("/webhooks/charthop", methods=["POST", "GET"])
@@ -510,13 +493,14 @@ def ch_webhook():
         return "ChartHop webhook up", 200
 
     evt = request.get_json(force=True, silent=True) or {}
-    evtype = evt.get("type", "")
-    entity = evt.get("entitytype", "")
-    entity_id = evt.get("entityid")
+    evtype = _evt_get(evt, "type", "eventType", "event_type") or ""
+    entity = _evt_get(evt, "entityType", "entitytype", "entity_type") or ""
+    entity_id = str(_evt_get(evt, "entityId", "entityid", "entity_id") or "")
 
-    # Ejemplo: crear Job en Teamtailor cuando ChartHop crea job
-    if entity == "job" and evtype in ("job.create",):
-        job = ch_find_job(str(entity_id))
+    print(f"CH evt: type={evtype} entity={entity} entity_id={entity_id}")
+
+    if entity.lower() == "job" and evtype in ("job.create", "job_create"):
+        job = ch_find_job(entity_id)
         if job:
             payload = {
                 "data": {
@@ -535,14 +519,14 @@ def ch_webhook():
                 tt_job_json = r.json() or {}
                 tt_job_id = ((tt_job_json.get("data") or {}).get("id") or "").strip()
                 if tt_job_id:
-                    # Persistir el vínculo en TT: charthop_job_id = entity_id
+                    # Persistir vínculo en TT: charthop_job_id
                     try:
-                        tt_upsert_job_custom_field(tt_job_id, str(entity_id))
+                        tt_upsert_job_custom_field(tt_job_id, entity_id)
                     except Exception as e:
                         print("TT set charthop_job_id error:", e)
-                    # Persistir el vínculo espejo en CH: teamtailorJobid = tt_job_id
+                    # Persistir vínculo espejo en CH: teamtailorJobid
                     try:
-                        ch_upsert_job_field(str(entity_id), CH_CF_JOB_TT_ID_LABEL, tt_job_id)
+                        ch_upsert_job_field(entity_id, CH_CF_JOB_TT_ID_LABEL, tt_job_id)
                     except Exception as e:
                         print("CH set teamtailorJobid error:", e)
             except Exception as e:
@@ -551,17 +535,18 @@ def ch_webhook():
     return "", 200
 
 # =========================
-# Multiplexor de raíz (ChartHop obliga a POST "/")
+# Multiplexor raíz
 # =========================
 @app.route("/", methods=["GET", "POST"])
 def root():
+    print(f"{request.method} {request.path} UA={request.headers.get('User-Agent')} len={request.content_length}")
     if request.method == "GET":
         return "OK", 200
     payload = request.get_json(force=True, silent=True) or {}
-    # Si trae firma/shape de Teamtailor
-    if request.headers.get("Teamtailor-Signature") or "resource_id" in payload:
+    # Si parece Teamtailor
+    if request.headers.get("Teamtailor-Signature") or _has_key(payload, "resource_id"):
         return tt_webhook()
-    # Por defecto, tratamos como ChartHop
+    # Por defecto, ChartHop
     return ch_webhook()
 
 # =========================
@@ -592,5 +577,4 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    # Para pruebas locales
     app.run(host="0.0.0.0", port=8080)
