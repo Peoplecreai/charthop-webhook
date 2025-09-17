@@ -28,10 +28,10 @@ CA_SFTP_KEY = os.getenv("CA_SFTP_KEY")
 CA_SFTP_PASSPHRASE = os.getenv("CA_SFTP_PASSPHRASE")
 CA_SFTP_PATH = os.getenv("CA_SFTP_PATH", "/upload")
 
-# Custom fields para enlazar vacantes
-TT_CF_JOB_CH_ID = os.getenv("TT_CF_JOB_CH_ID")  # id del custom field en Teamtailor
+# Campos para enlazar vacantes
+TT_CF_JOB_CH_ID = os.getenv("TT_CF_JOB_CH_ID")  # opcional si ya conoces el ID en TT
 TT_CF_JOB_CH_API_NAME = os.getenv("TT_CF_JOB_CH_API_NAME", "charthop-job-id")
-CH_CF_JOB_TT_ID_LABEL = os.getenv("CH_CF_JOB_TT_ID_LABEL", "teamtailorJobid")  # etiqueta visible en CH
+CH_CF_JOB_TT_ID_LABEL = os.getenv("CH_CF_JOB_TT_ID_LABEL", "teamtailorJobid")
 
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "es-LA")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "UTC")
@@ -63,7 +63,7 @@ def runn_headers():
 # Helpers generales
 # =========================
 def tt_verify_signature(payload: dict):
-    # HMAC-SHA256(resource_id) -> hex -> base64, si TT_SIGNATURE_KEY está seteada
+    # Teamtailor: HMAC-SHA256(resource_id) -> hex -> base64
     if not TT_SIGNATURE_KEY:
         return True
     provided = request.headers.get("Teamtailor-Signature", "")
@@ -101,7 +101,6 @@ def compose_location(state_or_city: str, country_code: str):
     return ""
 
 def _evt_get(d: dict, *keys):
-    """Obtiene d[key] tolerando casing y variantes."""
     if not isinstance(d, dict):
         return None
     for k in keys:
@@ -124,10 +123,10 @@ def _has_key(d: dict, *keys) -> bool:
 # ChartHop helpers
 # =========================
 def ch_find_job(job_id: str):
-    """Busca un Job por jobid usando el endpoint y q=jobid\{id} (doc oficial)."""
+    """Busca un Job por jobid usando el filtro documentado q=jobid\{id}."""
     url = f"{CH_API}/v2/org/{CH_ORG_ID}/job"
     params = {
-        "q": f"jobid\\{job_id}",  # ChartHop carrot filter: field\value
+        "q": f"jobid\\{job_id}",
         "fields": "title,department name,location name,open"
     }
     try:
@@ -135,7 +134,6 @@ def ch_find_job(job_id: str):
         if r.status_code == 200:
             items = (r.json() or {}).get("data") or []
             return items[0] if items else None
-        # log útil para diagnosticar permisos/sintaxis
         print("ch_find_job status:", r.status_code, (r.text or "")[:300])
     except Exception as e:
         print("ch_find_job error:", e)
@@ -180,7 +178,7 @@ def ch_import_people_csv(rows):
     return r.json()
 
 def ch_upsert_job_field(job_id: str, field_label: str, value: str):
-    """Actualiza un campo custom de Job en CH vía import CSV."""
+    """Actualiza un campo custom de Job en ChartHop vía import CSV."""
     sio = io.StringIO()
     w = csv.DictWriter(sio, fieldnames=["job id", field_label])
     w.writeheader()
@@ -264,7 +262,6 @@ def tt_upsert_job_custom_field(job_id: str, value: str,
     r.raise_for_status()
 
 def tt_get_job_charthop_id(tt_job_id: str) -> str | None:
-    """Lee el valor del custom field charthop_job_id en un Job de TT."""
     cf_id = TT_CF_JOB_CH_ID or tt_get_custom_field_id_by_api_name(TT_CF_JOB_CH_API_NAME)
     if not cf_id:
         return None
@@ -304,7 +301,7 @@ def runn_upsert_person(name, email, role_id=None, team_id=None, employment_type=
     r.raise_for_status()
 
 def runn_create_leave(person_id, starts_at, ends_at, reason="Vacation", external_ref=None):
-    payload = {"personId": person_id, "startsAt": starts_at, "EndsAt": ends_at, "reason": reason}
+    payload = {"personId": person_id, "startsAt": starts_at, "endsAt": ends_at, "reason": reason}
     if external_ref: payload["externalRef"] = external_ref
     r = requests.post(f"{RUNN_API}/time-offs/leave", headers=runn_headers(), json=payload, timeout=HTTP_TIMEOUT)
     r.raise_for_status(); return r.json()
@@ -392,7 +389,8 @@ def _sftp_ensure_dirs(sftp: paramiko.SFTPClient, remote_dir: str):
 
 def sftp_upload(host: str, username: str, password: str = None, pkey_pem: str = None,
                 remote_path: str = "/upload/employee_import.csv", content: str = "") -> None:
-    sock = socket.create_connection((host, 22), timeout=15)
+    # Nota: evita trailing dot en host
+    sock = socket.create_connection((host.rstrip("."), 22), timeout=15)
     transport = paramiko.Transport(sock)
     transport.banner_timeout = 15
 
@@ -426,6 +424,96 @@ def sftp_upload(host: str, username: str, password: str = None, pkey_pem: str = 
 # =========================
 # Webhooks
 # =========================
+@app.route("/webhooks/teamtailor", methods=["POST"])
+def tt_webhook():
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        resource_id = payload.get("resource_id") or payload.get("id") or ""
+        provided = request.headers.get("Teamtailor-Signature", "")
+
+        # Firma
+        try:
+            tt_verify_signature(payload)
+            print(f"TT sig ok rid={resource_id} hdr_len={len(provided)}")
+        except Exception as e:
+            print(f"TT sig fail rid={resource_id} err={repr(e)}")
+            return "", 200
+
+        if not resource_id:
+            print("TT webhook: missing resource_id")
+            return "", 200
+
+        # Fetch de TT
+        try:
+            resp = requests.get(
+                f"{TT_API}/job-applications/{resource_id}?include=candidate,job",
+                headers=tt_headers(), timeout=HTTP_TIMEOUT
+            )
+            print("TT fetch status:", resp.status_code)
+        except Exception as e:
+            print("TT fetch error:", repr(e))
+            return "", 200
+
+        if not resp.ok:
+            print("TT fetch non-OK:", resp.status_code, (resp.text or "")[:200])
+            return "", 200
+
+        body = resp.json() or {}
+        data = body.get("data") or {}
+        attributes = data.get("attributes") or {}
+        status = (attributes.get("status") or attributes.get("state") or "").lower()
+        hired_at = attributes.get("hired-at") or attributes.get("hired_at")
+        if status != "hired" and not hired_at:
+            print("TT webhook: application not hired, skipping")
+            return "", 200
+
+        included = body.get("included") or []
+        candidate = next((i for i in included if i.get("type") == "candidates"), {}) or {}
+        job = next((i for i in included if i.get("type") == "jobs"), {}) or {}
+
+        cand_attr = candidate.get("attributes") or {}
+        job_attr = job.get("attributes") or {}
+
+        first = cand_attr.get("first-name") or cand_attr.get("first_name") or ""
+        last = cand_attr.get("last-name") or cand_attr.get("last_name") or ""
+        personal_email = cand_attr.get("email") or ""
+        title = job_attr.get("title") or ""
+        start_date = attributes.get("start-date") or attributes.get("start_date") or (hired_at or "")[:10]
+        work_email = generate_unique_work_email(first, last)
+
+        # ChartHop y Runn
+        try:
+            rows = [{
+                "contact personalemail": personal_email,
+                **({"contact workemail": work_email} if work_email else {}),
+                "first name": first, "last name": last,
+                "title": title, "start date": start_date
+            }]
+            ch_import_people_csv(rows)
+            print("CH import ok")
+        except Exception as e:
+            print("ChartHop import error:", repr(e))
+
+        try:
+            if work_email:
+                runn_upsert_person(
+                    name=f"{first} {last}".strip(),
+                    email=work_email,
+                    employment_type="employee",
+                    starts_at=start_date
+                )
+                print("Runn upsert ok")
+            else:
+                print("Runn upsert skip: no corporate email")
+        except Exception as e:
+            print("Runn upsert error:", repr(e))
+
+        return "", 200
+
+    except Exception as e:
+        print("tt_webhook top-level error:", repr(e))
+        return "", 200
+
 @app.route("/webhooks/charthop", methods=["POST", "GET"])
 def ch_webhook():
     if request.method == "GET":
@@ -438,7 +526,6 @@ def ch_webhook():
 
     print(f"CH evt: type={evtype} entity={entity} entity_id={entity_id}")
 
-    # normalizaciones
     is_job    = entity.lower() in ("job", "jobs")
     is_create = evtype.lower() in ("job.create", "job_create", "create")
     is_update = evtype.lower() in ("job.update", "job_update", "update", "change")
@@ -449,13 +536,11 @@ def ch_webhook():
                 print("CH job create: missing entity_id")
                 return "", 200
 
-            # 1) Buscar el job en CH (puede dar 404/401 -> lo capturamos)
             job = ch_find_job(entity_id)
             if not job:
                 print(f"CH job create: job {entity_id} not found in CH")
                 return "", 200
 
-            # 2) Crear job en TT
             payload = {
                 "data": {
                     "type": "jobs",
@@ -470,7 +555,6 @@ def ch_webhook():
             print("TT job create status:", r.status_code, str(r.text)[:300])
             r.raise_for_status()
 
-            # 3) Leer id y enlazar IDs
             tt_job_json = r.json() or {}
             tt_job_id = ((tt_job_json.get("data") or {}).get("id") or "").strip()
             if tt_job_id:
@@ -484,7 +568,6 @@ def ch_webhook():
                     print("CH set teamtailorJobid error:", e)
 
         except Exception as e:
-            # Capturamos TODO para no devolver 500 a ChartHop
             print("CH job create handler error:", repr(e))
 
         return "", 200
@@ -493,7 +576,6 @@ def ch_webhook():
         print(f"CH job update ignored (entity_id={entity_id})")
         return "", 200
 
-    # Otros eventos CH
     return "", 200
 
 # =========================
@@ -505,10 +587,8 @@ def root():
     if request.method == "GET":
         return "OK", 200
     payload = request.get_json(force=True, silent=True) or {}
-    # Si parece Teamtailor
     if request.headers.get("Teamtailor-Signature") or _has_key(payload, "resource_id"):
         return tt_webhook()
-    # Por defecto, ChartHop
     return ch_webhook()
 
 # =========================
