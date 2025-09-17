@@ -493,13 +493,20 @@ def ch_webhook():
         return "ChartHop webhook up", 200
 
     evt = request.get_json(force=True, silent=True) or {}
+    # parseo tolerante de llaves
     evtype = _evt_get(evt, "type", "eventType", "event_type") or ""
     entity = _evt_get(evt, "entityType", "entitytype", "entity_type") or ""
     entity_id = str(_evt_get(evt, "entityId", "entityid", "entity_id") or "")
 
     print(f"CH evt: type={evtype} entity={entity} entity_id={entity_id}")
 
-    if entity.lower() == "job" and evtype in ("job.create", "job_create"):
+    # normalizaciones
+    is_job    = entity.lower() in ("job", "jobs")
+    is_create = evtype.lower() in ("job.create", "job_create", "create")
+    is_update = evtype.lower() in ("job.update", "job_update", "update", "change")
+
+    # crear Job en Teamtailor cuando CH crea un Job
+    if is_job and is_create:
         job = ch_find_job(entity_id)
         if job:
             payload = {
@@ -532,7 +539,12 @@ def ch_webhook():
             except Exception as e:
                 print("TT job create error:", e)
 
+    # opcional: loguear updates para referencia
+    elif is_job and is_update:
+        print(f"CH job update ignored (entity_id={entity_id})")
+
     return "", 200
+
 
 # =========================
 # Multiplexor raíz
