@@ -28,6 +28,11 @@ CA_SFTP_KEY = os.getenv("CA_SFTP_KEY")                     # privada PEM (Secret
 CA_SFTP_PASSPHRASE = os.getenv("CA_SFTP_PASSPHRASE")       # opcional
 CA_SFTP_PATH = os.getenv("CA_SFTP_PATH", "/upload")
 
+# Custom fields (en TT y CH) para enlazar vacantes
+TT_CF_JOB_CH_ID = os.getenv("TT_CF_JOB_CH_ID")             # id del custom field en Teamtailor (recomendado)
+TT_CF_JOB_CH_API_NAME = os.getenv("TT_CF_JOB_CH_API_NAME", "charthop_job_id")  # fallback por api-name
+CH_CF_JOB_TT_ID_LABEL = os.getenv("CH_CF_JOB_TT_ID_LABEL", "teamtailorJobid")  # etiqueta visible del field en CH
+
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "es-LA")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "UTC")
 CORP_EMAIL_DOMAIN = os.getenv("CORP_EMAIL_DOMAIN", "creai.mx")
@@ -58,7 +63,7 @@ def runn_headers():
 # Helpers generales
 # =========================
 def tt_verify_signature(payload: dict):
-    # Teamtailor: HMAC-SHA256(resource_id) -> hex -> base64
+    # Teamtailor: HMAC-SHA256(resource_id) -> hex -> base64 (si configuras TT_SIGNATURE_KEY)
     if not TT_SIGNATURE_KEY:
         return True
     provided = request.headers.get("Teamtailor-Signature", "")
@@ -109,7 +114,7 @@ def ch_find_job(job_id: str):
 def ch_email_exists(email: str) -> bool:
     if not email: return False
     try:
-        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job"
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/person"
         params = {"q": f"contact workemail\\{email}", "fields": "contact workemail"}
         r = requests.get(url, headers=ch_headers(), params=params, timeout=HTTP_TIMEOUT)
         if not r.ok: return False
@@ -143,6 +148,114 @@ def ch_import_people_csv(rows):
     r = requests.post(url, headers=ch_headers(), params=params, files=files, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
+
+def ch_upsert_job_field(job_id: str, field_label: str, value: str):
+    """
+    Actualiza un campo custom de Job en ChartHop vía import CSV (forma estable).
+    field_label debe coincidir con la etiqueta visible del campo en CH.
+    """
+    sio = io.StringIO()
+    w = csv.DictWriter(sio, fieldnames=["job id", field_label])
+    w.writeheader()
+    w.writerow({"job id": job_id, field_label: value})
+    sio.seek(0)
+    files = {"file": ("jobs.csv", sio.read())}
+    url = f"{CH_API}/v1/org/{CH_ORG_ID}/import/csv/data"
+    params = {"upsert": "true"}
+    r = requests.post(url, headers=ch_headers(), params=params, files=files, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+# =========================
+# Teamtailor custom fields helpers
+# =========================
+def tt_get_custom_field_id_by_api_name(api_name: str) -> str | None:
+    r = requests.get(f"{TT_API}/custom-fields", headers=tt_headers(),
+                     params={"filter[api-name]": api_name}, timeout=HTTP_TIMEOUT)
+    if r.ok:
+        data = (r.json() or {}).get("data") or []
+        for cf in data:
+            attrs = cf.get("attributes") or {}
+            if (attrs.get("api-name") or attrs.get("api_name")) == api_name:
+                return cf.get("id")
+    return None
+
+def tt_find_job_custom_field_value_id(job_id: str, custom_field_id: str) -> str | None:
+    r = requests.get(f"{TT_API}/jobs/{job_id}",
+                     headers=tt_headers(),
+                     params={"include": "custom-field-values,custom-field-values.custom-field"},
+                     timeout=HTTP_TIMEOUT)
+    if not r.ok:
+        return None
+    inc = (r.json() or {}).get("included") or []
+    for item in inc:
+        if item.get("type") == "custom-field-values":
+            rel = (item.get("relationships") or {}).get("custom-field") or {}
+            rel_data = rel.get("data") or {}
+            if str(rel_data.get("id")) == str(custom_field_id):
+                return item.get("id")
+    return None
+
+def tt_upsert_job_custom_field(job_id: str, value: str,
+                               custom_field_id: str | None = None,
+                               api_name: str | None = TT_CF_JOB_CH_API_NAME):
+    cf_id = custom_field_id or TT_CF_JOB_CH_ID
+    if not cf_id and api_name:
+        cf_id = tt_get_custom_field_id_by_api_name(api_name)
+    if not cf_id:
+        raise RuntimeError("No se pudo resolver el ID del custom field de Teamtailor")
+
+    # Intento de POST; si ya existe valor, hacemos PATCH
+    payload = {
+        "data": {
+            "type": "custom-field-values",
+            "attributes": {"value": str(value)},
+            "relationships": {
+                "owner": {"data": {"type": "jobs", "id": str(job_id)}},
+                "custom-field": {"data": {"type": "custom-fields", "id": str(cf_id)}}
+            }
+        }
+    }
+    url = f"{TT_API}/custom-field-values"
+    r = requests.post(url, headers=tt_headers(), json=payload, timeout=HTTP_TIMEOUT)
+    if r.status_code in (200, 201):
+        return r.json()
+
+    # Si ya existe, buscamos el ID y hacemos PATCH
+    cfv_id = tt_find_job_custom_field_value_id(job_id, cf_id)
+    if cfv_id:
+        patch = {
+            "data": {
+                "id": cfv_id,
+                "type": "custom-field-values",
+                "attributes": {"value": str(value)}
+            }
+        }
+        pr = requests.patch(f"{TT_API}/custom-field-values/{cfv_id}",
+                            headers=tt_headers(), json=patch, timeout=HTTP_TIMEOUT)
+        pr.raise_for_status()
+        return pr.json()
+
+    r.raise_for_status()
+
+def tt_get_job_charthop_id(tt_job_id: str) -> str | None:
+    """Lee el valor del custom field charthop_job_id en un Job de TT."""
+    cf_id = TT_CF_JOB_CH_ID or tt_get_custom_field_id_by_api_name(TT_CF_JOB_CH_API_NAME)
+    if not cf_id:
+        return None
+    r = requests.get(f"{TT_API}/jobs/{tt_job_id}",
+                     headers=tt_headers(),
+                     params={"include": "custom-field-values,custom-field-values.custom-field"},
+                     timeout=HTTP_TIMEOUT)
+    if not r.ok:
+        return None
+    inc = (r.json() or {}).get("included") or []
+    for item in inc:
+        if item.get("type") == "custom-field-values":
+            rel = (item.get("relationships") or {}).get("custom-field") or {}
+            if str((rel.get("data") or {}).get("id")) == str(cf_id):
+                return (item.get("attributes") or {}).get("value")
+    return None
 
 # =========================
 # Runn helpers
@@ -261,6 +374,19 @@ def build_ca_csv_from_charthop():
 # =========================
 # SFTP con timeouts y soporte Ed25519/RSA
 # =========================
+def _sftp_ensure_dirs(sftp: paramiko.SFTPClient, remote_dir: str):
+    # Crea directorios intermedios si no existen (mkdir -p)
+    if not remote_dir or remote_dir == "/":
+        return
+    parts = []
+    for p in remote_dir.strip("/").split("/"):
+        parts.append(p)
+        path = "/" + "/".join(parts)
+        try:
+            sftp.stat(path)
+        except FileNotFoundError:
+            sftp.mkdir(path)
+
 def sftp_upload(host: str, username: str, password: str = None, pkey_pem: str = None,
                 remote_path: str = "/upload/employee_import.csv", content: str = "") -> None:
     """Sube un archivo por SFTP con timeouts defensivos."""
@@ -286,11 +412,13 @@ def sftp_upload(host: str, username: str, password: str = None, pkey_pem: str = 
             raise RuntimeError("SFTP necesita CA_SFTP_KEY o CA_SFTP_PASS")
         transport.connect(username=username, password=password)
 
-    # 4) SFTP y escritura
+    # 4) SFTP y escritura binaria
     sftp = paramiko.SFTPClient.from_transport(transport)
     try:
-        with sftp.file(remote_path, "w") as f:
-            f.write(content)
+        remote_dir = os.path.dirname(remote_path) or "/"
+        _sftp_ensure_dirs(sftp, remote_dir)
+        with sftp.file(remote_path, "wb") as f:
+            f.write(content.encode("utf-8"))
             f.flush()
     finally:
         try:
@@ -317,7 +445,9 @@ def tt_webhook():
         )
     except Exception as e:
         print("TT fetch error:", e); return "", 200
-    if not resp.ok: return "", 200
+    if not resp.ok:
+        print("TT fetch non-OK:", resp.status_code, resp.text[:300])
+        return "", 200
 
     body = resp.json() or {}
     data = body.get("data") or {}
@@ -344,8 +474,8 @@ def tt_webhook():
 
     # 1) ChartHop: personal email SOLO aquí + work email definitivo
     rows = [{
-        "personal email": personal_email,
-        **({"work email": work_email} if work_email else {}),
+        "contact personalemail": personal_email,            # etiqueta completa para evitar campos ambiguos
+        **({"contact workemail": work_email} if work_email else {}),
         "first name": first, "last name": last,
         "title": title, "start date": start_date
     }]
@@ -367,6 +497,10 @@ def tt_webhook():
             print("Runn upsert skip: no corporate email")
     except Exception as e:
         print("Runn upsert error:", e)
+
+    # 3) Si necesitas saber el job de CH desde TT más adelante:
+    # tt_job_id = job.get("id") or ""
+    # ch_job_id = tt_get_job_charthop_id(tt_job_id) if tt_job_id else None
 
     return "", 200
 
@@ -397,6 +531,20 @@ def ch_webhook():
             try:
                 r = requests.post(f"{TT_API}/jobs", headers=tt_headers(), json=payload, timeout=HTTP_TIMEOUT)
                 print("TT job create status:", r.status_code, str(r.text)[:300])
+                r.raise_for_status()
+                tt_job_json = r.json() or {}
+                tt_job_id = ((tt_job_json.get("data") or {}).get("id") or "").strip()
+                if tt_job_id:
+                    # Persistir el vínculo en TT: charthop_job_id = entity_id
+                    try:
+                        tt_upsert_job_custom_field(tt_job_id, str(entity_id))
+                    except Exception as e:
+                        print("TT set charthop_job_id error:", e)
+                    # Persistir el vínculo espejo en CH: teamtailorJobid = tt_job_id
+                    try:
+                        ch_upsert_job_field(str(entity_id), CH_CF_JOB_TT_ID_LABEL, tt_job_id)
+                    except Exception as e:
+                        print("CH set teamtailorJobid error:", e)
             except Exception as e:
                 print("TT job create error:", e)
 
@@ -423,6 +571,9 @@ def root():
 def nightly():
     try:
         csv_text = build_ca_csv_from_charthop()
+        if not csv_text or csv_text.count("\n") <= 1:
+            raise RuntimeError("CSV vacío para Culture Amp")
+        print("CA CSV bytes:", len(csv_text.encode("utf-8")))
         fname = f"{CA_SFTP_PATH.rstrip('/')}/employees_{dt.date.today().isoformat()}.csv"
         sftp_upload(
             host=CA_SFTP_HOST,
