@@ -1,10 +1,33 @@
+from typing import Optional
+
 import requests
-from app.utils.config import TT_API, tt_headers, TT_CF_JOB_CH_ID, TT_CF_JOB_CH_API_NAME, HTTP_TIMEOUT
+
+from app.utils.config import (
+    TT_API,
+    TT_CF_JOB_CH_API_NAME,
+    TT_CF_JOB_CH_ID,
+    HTTP_TIMEOUT,
+    tt_headers,
+)
 
 def tt_create_job_from_ch(title: str, body: str = "Created from ChartHop", status: str = "unlisted"):
     payload = {"data": {"type": "jobs", "attributes": {"title": title or "Untitled", "body": body, "status": status}}}
     r = requests.post(f"{TT_API}/jobs", headers=tt_headers(), json=payload, timeout=HTTP_TIMEOUT)
     return r
+
+
+def tt_update_job(job_id: str, *, title: Optional[str] = None, body: Optional[str] = None, status: Optional[str] = None):
+    attributes = {}
+    if title:
+        attributes["title"] = title
+    if body:
+        attributes["body"] = body
+    if status:
+        attributes["status"] = status
+    if not attributes:
+        return None
+    payload = {"data": {"type": "jobs", "id": str(job_id), "attributes": attributes}}
+    return requests.patch(f"{TT_API}/jobs/{job_id}", headers=tt_headers(), json=payload, timeout=HTTP_TIMEOUT)
 
 def tt_get_custom_field_id_by_api_name(api_name: str) -> str | None:
     r = requests.get(f"{TT_API}/custom-fields", headers=tt_headers(),
@@ -57,42 +80,48 @@ def tt_upsert_job_custom_field(job_id: str, value: str,
     r.raise_for_status()
 
 def tt_fetch_application(app_id: str):
-    return requests.get(f"{TT_API}/job-applications/{app_id}",
-                        headers=tt_headers(),
-                        params={"include":"candidate,job,offers"},
-                        timeout=HTTP_TIMEOUT)
+    return requests.get(
+        f"{TT_API}/job-applications/{app_id}",
+        headers=tt_headers(),
+        params={"include": "candidate,job,offers"},
+        timeout=HTTP_TIMEOUT,
+    )
 
-def tt_get_offer_start_date_for_application(app_id: str) -> str | None:
+def tt_get_offer_start_date_for_application(app_id: str, payload: Optional[dict] = None) -> Optional[str]:
     try:
-        r = tt_fetch_application(app_id)
-        if r.ok:
-            payload = r.json() or {}
-            for inc in (payload.get("included") or []):
-                if inc.get("type") in ("job-offers", "offers"):
-                    attrs = inc.get("attributes") or {}
+        if payload is None:
+            resp = tt_fetch_application(app_id)
+            if not resp.ok:
+                return None
+            payload = resp.json() or {}
+        for inc in (payload.get("included") or []):
+            if inc.get("type") in ("job-offers", "offers"):
+                attrs = inc.get("attributes") or {}
+                details = attrs.get("details") or {}
+                sd = (details.get("start-date") or details.get("start_date") or "").strip()
+                if sd:
+                    return sd[:10]
+        data = payload.get("data") or {}
+        rels = (data.get("relationships") or {})
+        links = (rels.get("offers") or rels.get("job-offers") or {}).get("links") or {}
+        if links.get("related"):
+            rr = requests.get(links["related"], headers=tt_headers(), timeout=HTTP_TIMEOUT)
+            if rr.ok:
+                body = rr.json() or {}
+                items = body.get("data")
+                items = items if isinstance(items, list) else [items]
+                for of in items or []:
+                    attrs = of.get("attributes") or {}
                     details = attrs.get("details") or {}
                     sd = (details.get("start-date") or details.get("start_date") or "").strip()
                     if sd:
                         return sd[:10]
-            # relación offers si viene con links
-            data = payload.get("data") or {}
-            rels = (data.get("relationships") or {})
-            links = (rels.get("offers") or rels.get("job-offers") or {}).get("links") or {}
-            if links.get("related"):
-                rr = requests.get(links["related"], headers=tt_headers(), timeout=HTTP_TIMEOUT)
-                if rr.ok:
-                    body = rr.json() or {}
-                    items = body.get("data")
-                    items = items if isinstance(items, list) else [items]
-                    for of in items or []:
-                        attrs = of.get("attributes") or {}
-                        details = attrs.get("details") or {}
-                        sd = (details.get("start-date") or details.get("start_date") or "").strip()
-                        if sd:
-                            return sd[:10]
-        # último intento: colección filtrada
-        rr = requests.get(f"{TT_API}/job-offers", headers=tt_headers(),
-                          params={"filter[job-application-id]": app_id}, timeout=HTTP_TIMEOUT)
+        rr = requests.get(
+            f"{TT_API}/job-offers",
+            headers=tt_headers(),
+            params={"filter[job-application-id]": app_id},
+            timeout=HTTP_TIMEOUT,
+        )
         if rr.ok:
             for of in (rr.json() or {}).get("data", []):
                 attrs = of.get("attributes") or {}

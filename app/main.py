@@ -1,10 +1,13 @@
 from flask import Flask, request
-from app.blueprints.charthop_webhook import bp_ch
-from app.blueprints.teamtailor_webhook import bp_tt
+
+from app.blueprints.charthop_webhook import bp_ch, ch_webhook as ch_handler
+from app.blueprints.teamtailor_webhook import bp_tt, tt_webhook as tt_handler
+from app.blueprints.cron import bp_cron
 
 app = Flask(__name__)
 app.register_blueprint(bp_ch)
 app.register_blueprint(bp_tt)
+app.register_blueprint(bp_cron)
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -15,10 +18,9 @@ def root():
     print(f"{request.method} {request.path} len={request.content_length}")
     if request.method == "GET":
         return "OK", 200
-    # Multiplexor simple: si viene cabecera de TT o resource_id, pásalo a TT webhook
     if request.headers.get("Teamtailor-Signature"):
-        return bp_tt.view_functions["teamtailor_webhook"]()
+        return tt_handler()
     payload = request.get_json(force=True, silent=True) or {}
-    if "resource_id" in (payload or {}):
-        return bp_tt.view_functions["teamtailor_webhook"]()
-    return bp_ch.view_functions["charthop_webhook"]()
+    if "resource_id" in payload:
+        return tt_handler()
+    return ch_handler()
