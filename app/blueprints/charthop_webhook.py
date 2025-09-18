@@ -1,7 +1,5 @@
 from flask import Blueprint, request
-from app.utils.config import CH_CF_JOB_TT_ID_LABEL
-from app.clients.charthop import ch_find_job, ch_upsert_job_field
-from app.clients.teamtailor import tt_create_job_from_ch, tt_upsert_job_custom_field
+from app.services.job_sync import sync_job_create, sync_job_update
 
 bp_ch = Blueprint("charthop_webhook", __name__)
 
@@ -26,27 +24,9 @@ def ch_webhook():
     if is_create:
         if not entity_id:
             print("CH job create: missing entity_id"); return "", 200
-        job = ch_find_job(entity_id)
-        if not job:
-            print(f"CH job create: job {entity_id} not found"); return "", 200
+        sync_job_create(entity_id)
 
-        title = job.get("title") or "Untitled"
-        r = tt_create_job_from_ch(title)
-        print("TT job create status:", r.status_code, str(r.text)[:200])
-        if not r.ok:
-            return "", 200
-        tt_job_id = ((r.json() or {}).get("data") or {}).get("id")
-        if tt_job_id:
-            try:
-                tt_upsert_job_custom_field(tt_job_id, entity_id)
-            except Exception as e:
-                print("TT set charthop_job_id error:", e)
-            try:
-                ch_upsert_job_field(entity_id, CH_CF_JOB_TT_ID_LABEL, tt_job_id)
-            except Exception as e:
-                print("CH set teamtailorJobid error:", e)
-
-    if is_update:
-        print(f"CH job update received for {entity_id} (PATCH en TT opcional)")
+    if is_update and entity_id:
+        sync_job_update(entity_id)
     return "", 200
 
