@@ -4,7 +4,7 @@ import datetime as dt
 import time
 from typing import Optional
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
 
 from app.tasks.ca_export import enqueue_export_task
 from app.services.runn_sync import sync_runn_onboarding, sync_runn_timeoff
@@ -41,6 +41,7 @@ def nightly():
         return _json_ok({"status": "queued", "elapsed_ms": elapsed_ms, "task": task}, 200)
     except RuntimeError as exc:
         elapsed_ms = int((time.time() - t0) * 1000)
+        current_app.logger.error("Nightly export failed: %s", exc)
         return _json_ok(
             {
                 "status": "error",

@@ -7,6 +7,7 @@ from typing import Optional
 
 from flask import Blueprint, jsonify
 
+# Dependencia opcional: si no está instalada, fallamos con un error claro
 try:  # pragma: no cover - dependencia opcional en runtime
     from google.cloud import tasks_v2  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - logging
@@ -15,6 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - logging
 from app.services.culture_amp import export_culture_amp_snapshot
 
 bp_tasks = Blueprint("tasks", __name__)
+
 
 def _require_tasks_module():
     if tasks_v2 is None:
@@ -41,9 +43,7 @@ def _load_config() -> dict:
         missing.append("TASKS_SA_EMAIL")
 
     if missing:
-        raise RuntimeError(
-            "Faltan variables para Cloud Tasks: " + ", ".join(missing)
-        )
+        raise RuntimeError("Faltan variables para Cloud Tasks: " + ", ".join(missing))
 
     return {
         "project": project,
