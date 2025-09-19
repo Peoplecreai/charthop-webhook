@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import time
+import traceback
 from typing import Optional
 
 from flask import Blueprint, jsonify, request, current_app
@@ -31,23 +32,21 @@ def _json_ok(payload: dict, status_code: int = 200):
 @bp_cron.route("/cron/nightly", methods=["GET", "POST"])
 def nightly():
     """
-    Cloud Scheduler: ENCOLA y responde inmediato para evitar 504.
-    El trabajo real lo ejecuta /tasks/export-culture-amp vía Cloud Tasks.
+    Cloud Scheduler: ENCOLA y responde inmediato.
+    Cualquier error (config, IAM, queue inexistente, lib ausente) responde JSON 503,
+    no 500 HTML.
     """
     t0 = time.time()
     try:
         task = enqueue_export_task()
         elapsed_ms = int((time.time() - t0) * 1000)
         return _json_ok({"status": "queued", "elapsed_ms": elapsed_ms, "task": task}, 200)
-    except RuntimeError as exc:
+    except Exception as exc:  # capturamos TODO
         elapsed_ms = int((time.time() - t0) * 1000)
-        current_app.logger.error("Nightly export failed: %s", exc)
+        current_app.logger.error("Nightly enqueue failed: %s\n%s", exc, traceback.format_exc())
+        # 503 para que el Scheduler lo trate como reintentable
         return _json_ok(
-            {
-                "status": "error",
-                "elapsed_ms": elapsed_ms,
-                "message": str(exc),
-            },
+            {"status": "error", "elapsed_ms": elapsed_ms, "message": str(exc)},
             503,
         )
 
@@ -61,21 +60,13 @@ def runn_onboarding():
         result = sync_runn_onboarding(reference)
         elapsed_ms = int((time.time() - t0) * 1000)
         return _json_ok(
-            {
-                "status": "ok",
-                "elapsed_ms": elapsed_ms,
-                "reference_date": reference.isoformat() if reference else None,
-                "result": result,
-            },
+            {"status": "ok", "elapsed_ms": elapsed_ms, "reference_date": reference.isoformat() if reference else None, "result": result},
             200,
         )
     except Exception as exc:  # pragma: no cover - logging
+        current_app.logger.error("runn_onboarding error: %s\n%s", exc, traceback.format_exc())
         return _json_ok(
-            {
-                "status": "error",
-                "message": str(exc),
-                "reference_date": reference.isoformat() if reference else None,
-            },
+            {"status": "error", "message": str(exc), "reference_date": reference.isoformat() if reference else None},
             500,
         )
 
@@ -89,20 +80,12 @@ def runn_timeoff():
         result = sync_runn_timeoff(reference)
         elapsed_ms = int((time.time() - t0) * 1000)
         return _json_ok(
-            {
-                "status": "ok",
-                "elapsed_ms": elapsed_ms,
-                "reference_date": reference.isoformat() if reference else None,
-                "result": result,
-            },
+            {"status": "ok", "elapsed_ms": elapsed_ms, "reference_date": reference.isoformat() if reference else None, "result": result},
             200,
         )
     except Exception as exc:  # pragma: no cover - logging
+        current_app.logger.error("runn_timeoff error: %s\n%s", exc, traceback.format_exc())
         return _json_ok(
-            {
-                "status": "error",
-                "message": str(exc),
-                "reference_date": reference.isoformat() if reference else None,
-            },
+            {"status": "error", "message": str(exc), "reference_date": reference.isoformat() if reference else None},
             500,
         )
