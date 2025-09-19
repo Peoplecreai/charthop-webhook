@@ -1,23 +1,77 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import time
-from typing import Optional
+from importlib import import_module
+from typing import Optional, TYPE_CHECKING
 
-from flask import Blueprint, jsonify, request
-from google.cloud import tasks_v2
+from flask import Blueprint, jsonify
+
+if TYPE_CHECKING:  # pragma: no cover - solo tipado
+    from google.cloud import tasks_v2 as tasks_v2_module
+
+_tasks_module: Optional["tasks_v2_module"] = None
+
+
+class CloudTasksNotConfigured(RuntimeError):
+    """Indica que Cloud Tasks no está disponible o configurado."""
+
+    pass
 
 from app.services.culture_amp import export_culture_amp_snapshot
 
 bp_tasks = Blueprint("tasks", __name__)
 
-# Config leída de entorno
-GCP_PROJECT = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
-TASKS_LOCATION = os.environ.get("TASKS_LOCATION", "northamerica-south1")
-TASKS_QUEUE = os.environ.get("TASKS_QUEUE", "export-queue")
-RUN_SERVICE_URL = os.environ.get("RUN_SERVICE_URL")  # p.ej. https://<servicio>.northamerica-south1.run.app
-TASKS_SA_EMAIL = os.environ.get("TASKS_SA_EMAIL")    # p.ej. tasks-runner@integration-hub-468417.iam.gserviceaccount.com
+def _require_tasks_module():
+    global _tasks_module
+
+    if _tasks_module is not None:
+        return _tasks_module
+
+    try:
+        module = import_module("google.cloud.tasks_v2")
+    except ModuleNotFoundError as exc:  # pragma: no cover - logging
+        raise CloudTasksNotConfigured(
+            "google-cloud-tasks no está instalado. Agrega 'google-cloud-tasks' a tus dependencias "
+            "o desactiva el cron de Culture Amp."
+        ) from exc
+    except Exception as exc:  # pragma: no cover - logging
+        raise CloudTasksNotConfigured(
+            f"No se pudo inicializar google-cloud-tasks: {exc}"
+        ) from exc
+
+    _tasks_module = module
+    return module
+
+
+def _load_config() -> dict:
+    project = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("TASKS_LOCATION", "northamerica-south1")
+    queue = os.environ.get("TASKS_QUEUE", "export-queue")
+    run_service_url = (os.environ.get("RUN_SERVICE_URL") or "").strip()
+    sa_email = (os.environ.get("TASKS_SA_EMAIL") or "").strip()
+
+    missing = []
+    if not project:
+        missing.append("GCP_PROJECT/GOOGLE_CLOUD_PROJECT")
+    if not run_service_url:
+        missing.append("RUN_SERVICE_URL")
+    if not sa_email:
+        missing.append("TASKS_SA_EMAIL")
+
+    if missing:
+        raise CloudTasksNotConfigured(
+            "Faltan variables para Cloud Tasks: " + ", ".join(missing)
+        )
+
+    return {
+        "project": project,
+        "location": location,
+        "queue": queue,
+        "run_service_url": run_service_url,
+        "service_account_email": sa_email,
+    }
 
 
 def enqueue_export_task(payload: Optional[dict] = None) -> dict:
@@ -25,28 +79,25 @@ def enqueue_export_task(payload: Optional[dict] = None) -> dict:
     Encola una tarea HTTP hacia /tasks/export-culture-amp con OIDC.
     Retorna datos del task creado.
     """
-    if not (GCP_PROJECT and TASKS_LOCATION and TASKS_QUEUE and RUN_SERVICE_URL and TASKS_SA_EMAIL):
-        raise RuntimeError(
-            "Faltan variables para Cloud Tasks: GCP_PROJECT/GOOGLE_CLOUD_PROJECT, "
-            "TASKS_LOCATION, TASKS_QUEUE, RUN_SERVICE_URL, TASKS_SA_EMAIL"
-        )
+    tasks_module = _require_tasks_module()
+    cfg = _load_config()
 
-    client = tasks_v2.CloudTasksClient()
-    parent = client.queue_path(GCP_PROJECT, TASKS_LOCATION, TASKS_QUEUE)
+    client = tasks_module.CloudTasksClient()
+    parent = client.queue_path(cfg["project"], cfg["location"], cfg["queue"])
 
-    url = f"{RUN_SERVICE_URL.rstrip('/')}/tasks/export-culture-amp"
+    url = f"{cfg['run_service_url'].rstrip('/')}/tasks/export-culture-amp"
     body_bytes = json.dumps(payload or {}).encode("utf-8")
 
     task = {
         "http_request": {
-            "http_method": tasks_v2.HttpMethod.POST,
+            "http_method": tasks_module.HttpMethod.POST,
             "url": url,
             "headers": {"Content-Type": "application/json"},
             "body": body_bytes,
             "oidc_token": {
-                "service_account_email": TASKS_SA_EMAIL,
+                "service_account_email": cfg["service_account_email"],
                 # La audiencia debe ser el ORIGEN del servicio (sin path)
-                "audience": RUN_SERVICE_URL,
+                "audience": cfg["run_service_url"],
             },
         }
     }
