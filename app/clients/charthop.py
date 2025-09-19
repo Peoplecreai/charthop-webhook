@@ -195,13 +195,26 @@ def ch_fetch_timeoff(start: date, end: date) -> List[Dict]:
     return []
 
 
+def _norm_date(s: str) -> str:
+    """Normaliza a YYYY-MM-DD si viene en formato ISO; en otros casos la deja tal cual."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return s
+
+
 def build_culture_amp_rows() -> List[Dict[str, str]]:
     fields = ",".join(
         [
-            "person id",
+            "employee id",                # preferido para Employee Id
+            "person id",                  # fallback
             "name first",
             "name last",
             "preferred name first",
+            "preferred name last",        # NUEVO: para armar Name con preferred
             "contact workemail",
             "contact personalemail",
             "manager contact workemail",
@@ -209,34 +222,69 @@ def build_culture_amp_rows() -> List[Dict[str, str]]:
             "seniority",
             "homeaddress country",
             "homeaddress region",
+            "homeaddress city",           # NUEVO: Location = ciudad
             "status",
+            "start date",                 # Start Date
+            "end date",                   # End Date
+            "department",                 # Department
+            "department name",            # fallback
+            "employment",                 # Employment Type
         ]
     )
     rows: List[Dict[str, str]] = []
     for person in ch_active_people(fields):
         flds = person.get("fields") or {}
+
         work = (flds.get("contact workemail") or "").strip()
         if not work:
             continue
-        preferred = flds.get("preferred name first") or ""
-        first = preferred or (flds.get("name first") or "")
-        last = flds.get("name last") or ""
-        name = " ".join(part for part in [first, last] if part).strip()
-        country = flds.get("homeaddress country") or ""
-        region = flds.get("homeaddress region") or ""
-        locale, timezone = derive_locale_timezone(country)
+
+        # Name: preferidos primero (first + last), luego first/last normales
+        pref_first = (flds.get("preferred name first") or "").strip()
+        pref_last = (flds.get("preferred name last") or "").strip()
+        first = (flds.get("name first") or "").strip()
+        last = (flds.get("name last") or "").strip()
+
+        if pref_first or pref_last:
+            name = " ".join(p for p in [pref_first, pref_last] if p).strip()
+        else:
+            name = " ".join(p for p in [first, last] if p).strip()
+
+        # Preferred Name (sigue siendo preferred first)
+        preferred_display = pref_first
+
+        # Location: solo la ciudad del home address
+        city = (flds.get("homeaddress city") or "").strip()
+
+        # Employee Id preferido, luego person id, luego email
+        employee_id = (
+            (flds.get("employee id") or "").strip()
+            or (flds.get("person id") or "").strip()
+            or work
+        )
+
+        start_raw = (flds.get("start date") or flds.get("startdate") or "").strip()
+        end_raw = (flds.get("end date") or flds.get("enddate") or "").strip()
+        department = (flds.get("department") or flds.get("department name") or "").strip()
+        country = (flds.get("homeaddress country") or "").strip()
+        employment = (flds.get("employment") or "").strip()
+        region = (flds.get("homeaddress region") or "").strip()  # se mantiene por si lo usas en otra parte
+
         rows.append(
             {
-                "Employee Id": flds.get("person id") or work,
+                "Employee Id": employee_id,
                 "Email": work,
                 "Name": name,
-                "Preferred Name": preferred,
+                "Preferred Name": preferred_display,
                 "Manager Email": flds.get("manager contact workemail") or "",
-                "Location": compose_location(region, country),
+                "Location": city,
                 "Job Title": flds.get("title") or "",
                 "Seniority": flds.get("seniority") or "",
-                "Locale": locale,
-                "Timezone": timezone,
+                "Start Date": _norm_date(start_raw),
+                "End Date": _norm_date(end_raw),
+                "Department": department,
+                "Country": country,
+                "Employment Type": employment,
             }
         )
     return rows
@@ -252,8 +300,11 @@ def culture_amp_csv_from_rows(rows: Iterable[Dict[str, str]]) -> str:
         "Location",
         "Job Title",
         "Seniority",
-        "Locale",
-        "Timezone",
+        "Start Date",
+        "End Date",
+        "Department",
+        "Country",
+        "Employment Type",
     ]
     sio = io.StringIO()
     writer = csv.DictWriter(sio, fieldnames=columns, extrasaction="ignore")
