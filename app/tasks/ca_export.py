@@ -7,6 +7,8 @@ from typing import Optional
 
 from flask import Blueprint, jsonify
 
+from google.protobuf import duration_pb2
+
 # Dependencia opcional: si no está instalada, fallamos con un error claro
 try:  # pragma: no cover - dependencia opcional en runtime
     from google.cloud import tasks_v2  # type: ignore
@@ -55,10 +57,6 @@ def _load_config() -> dict:
 
 
 def enqueue_export_task(payload: Optional[dict] = None) -> dict:
-    """
-    Encola una tarea HTTP hacia /tasks/export-culture-amp con OIDC.
-    Retorna datos del task creado.
-    """
     tasks_module = _require_tasks_module()
     cfg = _load_config()
 
@@ -68,6 +66,9 @@ def enqueue_export_task(payload: Optional[dict] = None) -> dict:
     url = f"{cfg['run_service_url'].rstrip('/')}/tasks/export-culture-amp"
     body_bytes = json.dumps(payload or {}).encode("utf-8")
 
+    # ← NUEVO: deadline de 900s para alinear con Cloud Run
+    deadline = duration_pb2.Duration(seconds=900)
+
     task = {
         "http_request": {
             "http_method": tasks_module.HttpMethod.POST,
@@ -76,10 +77,10 @@ def enqueue_export_task(payload: Optional[dict] = None) -> dict:
             "body": body_bytes,
             "oidc_token": {
                 "service_account_email": cfg["service_account_email"],
-                # La audiencia debe ser el ORIGEN del servicio (sin path)
                 "audience": cfg["run_service_url"],
             },
-        }
+        },
+        "dispatch_deadline": deadline,
     }
 
     created = client.create_task(request={"parent": parent, "task": task})
