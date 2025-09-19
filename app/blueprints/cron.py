@@ -4,7 +4,7 @@ import datetime as dt
 import time
 from typing import Optional
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
 
 from app.tasks.ca_export import enqueue_export_task
 from app.services.runn_sync import sync_runn_onboarding, sync_runn_timeoff
@@ -35,9 +35,21 @@ def nightly():
     El trabajo real lo ejecuta /tasks/export-culture-amp vía Cloud Tasks.
     """
     t0 = time.time()
-    task = enqueue_export_task()
-    elapsed_ms = int((time.time() - t0) * 1000)
-    return _json_ok({"status": "queued", "elapsed_ms": elapsed_ms, "task": task}, 200)
+    try:
+        task = enqueue_export_task()
+        elapsed_ms = int((time.time() - t0) * 1000)
+        return _json_ok({"status": "queued", "elapsed_ms": elapsed_ms, "task": task}, 200)
+    except RuntimeError as exc:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        current_app.logger.warning("Nightly export skipped: %s", exc)
+        return _json_ok(
+            {
+                "status": "skipped",
+                "elapsed_ms": elapsed_ms,
+                "message": str(exc),
+            },
+            200,
+        )
 
 
 @bp_cron.route("/cron/runn/onboarding", methods=["GET", "POST"])
