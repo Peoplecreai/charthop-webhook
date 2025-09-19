@@ -35,9 +35,20 @@ def nightly():
     El trabajo real lo ejecuta /tasks/export-culture-amp vía Cloud Tasks.
     """
     t0 = time.time()
-    task = enqueue_export_task()
-    elapsed_ms = int((time.time() - t0) * 1000)
-    return _json_ok({"status": "queued", "elapsed_ms": elapsed_ms, "task": task}, 200)
+    try:
+        task = enqueue_export_task()
+        elapsed_ms = int((time.time() - t0) * 1000)
+        return _json_ok({"status": "queued", "elapsed_ms": elapsed_ms, "task": task}, 200)
+    except RuntimeError as exc:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        return _json_ok(
+            {
+                "status": "error",
+                "elapsed_ms": elapsed_ms,
+                "message": str(exc),
+            },
+            503,
+        )
 
 
 @bp_cron.route("/cron/runn/onboarding", methods=["GET", "POST"])
