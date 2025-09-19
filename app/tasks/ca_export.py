@@ -9,6 +9,8 @@ from flask import Blueprint, jsonify
 
 from google.protobuf import duration_pb2
 
+import socket, logging, time as _t, os
+
 # Dependencia opcional: si no está instalada, fallamos con un error claro
 try:  # pragma: no cover - dependencia opcional en runtime
     from google.cloud import tasks_v2  # type: ignore
@@ -87,12 +89,26 @@ def enqueue_export_task(payload: Optional[dict] = None) -> dict:
     return {"name": created.name, "url": url}
 
 
+def _probe_sftp(host: str, port: int = 22, deadline: float = 10.0) -> bool:
+    if not host:
+        logging.error("CA_SFTP_HOST vacío")
+        return False
+    t0 = _t.time()
+    try:
+        with socket.create_connection((host.strip().rstrip("."), port), timeout=deadline):
+            logging.warning("SFTP TCP connect OK to %s:%d in %.2fs", host, port, _t.time()-t0)
+            return True
+    except Exception as e:
+        logging.error("SFTP TCP connect FAIL to %s:%d: %r (%.2fs)", host, port, e, _t.time()-t0)
+        return False
+
 @bp_tasks.post("/tasks/export-culture-amp")
 def run_export_task():
-    """
-    Ejecuta la exportación completa (invocado por Cloud Tasks con OIDC).
-    """
     t0 = time.time()
+    host = os.environ.get("CA_SFTP_HOST", "")
+    if not _probe_sftp(host):
+        # Responde rápido: Cloud Tasks reintenta sin consumir 10 minutos
+        return jsonify({"ok": False, "error": "sftp_tcp_connect_fail", "host": host}), 502
     try:
         result = export_culture_amp_snapshot()
         elapsed_ms = int((time.time() - t0) * 1000)
