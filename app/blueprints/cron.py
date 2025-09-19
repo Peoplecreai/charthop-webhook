@@ -41,14 +41,14 @@ def nightly():
         return _json_ok({"status": "queued", "elapsed_ms": elapsed_ms, "task": task}, 200)
     except RuntimeError as exc:
         elapsed_ms = int((time.time() - t0) * 1000)
-        current_app.logger.warning("Nightly export skipped: %s", exc)
+        current_app.logger.error("Nightly export failed: %s", exc)
         return _json_ok(
             {
-                "status": "skipped",
+                "status": "error",
                 "elapsed_ms": elapsed_ms,
                 "message": str(exc),
             },
-            200,
+            503,
         )
 
 

@@ -3,26 +3,40 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Optional
+from importlib import import_module
+from typing import Optional, TYPE_CHECKING
 
 from flask import Blueprint, jsonify
 
-try:  # pragma: no cover - dependencia opcional en runtime
-    from google.cloud import tasks_v2  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - logging
-    tasks_v2 = None  # type: ignore[assignment]
+if TYPE_CHECKING:  # pragma: no cover - solo tipado
+    from google.cloud import tasks_v2 as tasks_v2_module
+
+_tasks_module: Optional["tasks_v2_module"] = None
 
 from app.services.culture_amp import export_culture_amp_snapshot
 
 bp_tasks = Blueprint("tasks", __name__)
 
 def _require_tasks_module():
-    if tasks_v2 is None:
+    global _tasks_module
+
+    if _tasks_module is not None:
+        return _tasks_module
+
+    try:
+        module = import_module("google.cloud.tasks_v2")
+    except ModuleNotFoundError as exc:  # pragma: no cover - logging
         raise RuntimeError(
             "google-cloud-tasks no está instalado. Agrega 'google-cloud-tasks' a tus dependencias "
             "o desactiva el cron de Culture Amp."
-        )
-    return tasks_v2
+        ) from exc
+    except Exception as exc:  # pragma: no cover - logging
+        raise RuntimeError(
+            f"No se pudo inicializar google-cloud-tasks: {exc}"
+        ) from exc
+
+    _tasks_module = module
+    return module
 
 
 def _load_config() -> dict:
