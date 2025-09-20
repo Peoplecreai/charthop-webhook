@@ -8,6 +8,8 @@ from typing import Optional
 from flask import Blueprint, jsonify
 
 from google.protobuf import duration_pb2
+from google.api_core import exceptions as gexc
+import datetime as dt
 
 import socket, logging, time as _t, os
 
@@ -67,11 +69,14 @@ def enqueue_export_task(payload: Optional[dict] = None) -> dict:
 
     url = f"{cfg['run_service_url'].rstrip('/')}/tasks/export-culture-amp"
     body_bytes = json.dumps(payload or {}).encode("utf-8")
-
-    # ← NUEVO: deadline de 900s para alinear con Cloud Run
     deadline = duration_pb2.Duration(seconds=900)
 
+    # task_id fijo por día (cambia si quieres por hora/minuto)
+    task_id = f"export-ca-{dt.date.today().isoformat()}"
+    name = client.task_path(cfg["project"], cfg["location"], cfg["queue"], task_id)
+
     task = {
+        "name": name,  # ← evita duplicados
         "http_request": {
             "http_method": tasks_module.HttpMethod.POST,
             "url": url,
@@ -85,8 +90,12 @@ def enqueue_export_task(payload: Optional[dict] = None) -> dict:
         "dispatch_deadline": deadline,
     }
 
-    created = client.create_task(request={"parent": parent, "task": task})
-    return {"name": created.name, "url": url}
+    try:
+        created = client.create_task(request={"parent": parent, "task": task})
+        return {"name": created.name, "url": url}
+    except gexc.AlreadyExists:
+        # Ya hay una tarea para hoy: lo consideramos OK/idempotente
+        return {"name": name, "url": url, "status": "already_enqueued"}
 
 
 def _probe_sftp(host: str, port: int = 22, deadline: float = 10.0) -> bool:
