@@ -15,6 +15,10 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 CH_API = os.getenv("CH_API", "https://api.charthop.com")
 CH_ORG_ID = os.getenv("CH_ORG_ID")
 CH_API_TOKEN = os.getenv("CH_API_TOKEN")
+try:
+    CH_PEOPLE_PAGE_SIZE = max(int(os.getenv("CH_PEOPLE_PAGE_SIZE", "500")), 1)
+except ValueError:
+    CH_PEOPLE_PAGE_SIZE = 500
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "es-LA")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "UTC")
 CORP_EMAIL_DOMAIN = os.getenv("CORP_EMAIL_DOMAIN")

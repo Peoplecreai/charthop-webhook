@@ -1,7 +1,7 @@
 import io
 import os
 import socket
-from typing import Optional, Union
+from typing import Callable, Optional, TypeVar, Union
 
 import paramiko
 
@@ -24,6 +24,9 @@ def _sftp_ensure_dirs(sftp: paramiko.SFTPClient, remote_dir: str):
             sftp.mkdir(path)
 
 
+T = TypeVar("T")
+
+
 def sftp_upload(
     *,
     host: str,
@@ -32,15 +35,23 @@ def sftp_upload(
     pkey_pem: Optional[str] = None,
     passphrase: Optional[str] = None,
     remote_path: str,
-    content: Union[str, bytes],
-):
+    content: Optional[Union[str, bytes]] = None,
+    writer: Optional[Callable[[paramiko.SFTPFile], T]] = None,
+) -> Optional[T]:
     """
     Sube 'content' vía SFTP como archivo en 'remote_path'.
     - Admite auth por password o por llave (preferida para Culture Amp).
     - 'content' puede ser str (se codifica UTF-8) o bytes.
+    - Alternativamente, se puede proveer 'writer', un callback que recibe el handler
+      abierto y devuelve un resultado opcional (por ejemplo, métricas de subida).
     """
     if not host or not username:
         raise RuntimeError("SFTP requiere host y username configurados")
+
+    if content is None and writer is None:
+        raise ValueError("sftp_upload requiere 'content' o 'writer'")
+    if content is not None and writer is not None:
+        raise ValueError("sftp_upload no acepta 'content' y 'writer' al mismo tiempo")
 
     # Conexión TCP al puerto 22 con timeout corto para evitar cuelgues
     sock = socket.create_connection((host.rstrip("."), 22), timeout=15)
@@ -66,10 +77,15 @@ def sftp_upload(
             directory = os.path.dirname(remote_path) or "/"
             _sftp_ensure_dirs(sftp, directory)
 
-            payload = content if isinstance(content, (bytes, bytearray)) else content.encode("utf-8")
             with sftp.file(remote_path, "wb") as handler:
-                handler.write(payload)
+                result: Optional[T] = None
+                if writer is not None:
+                    result = writer(handler)
+                else:
+                    payload = content if isinstance(content, (bytes, bytearray)) else content.encode("utf-8")
+                    handler.write(payload)
                 handler.flush()
+                return result
         finally:
             try:
                 sftp.close()
