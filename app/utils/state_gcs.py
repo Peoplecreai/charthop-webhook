@@ -1,17 +1,34 @@
 from __future__ import annotations
 import json
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any
+
 from google.cloud import storage
 
 _BUCKET = os.environ.get("CA_STATE_BUCKET", "")
 _OBJECT = os.environ.get("CA_STATE_OBJECT", "culture-amp/state.json")
 
+
 def _client() -> storage.Client:
     return storage.Client()
 
+
 def load_state() -> Dict[str, Any]:
-    """Devuelve { rows: {empId: {hash, ch_person_id, row}}, version: 1 } o vacío."""
+    """
+    Devuelve el manifest previo:
+    {
+      "version": 1,
+      "rows": {
+         "<Employee Id>": {
+            "hash": "<sha256>",
+            "ch_person_id": "<ChartHop person id>",
+            "row": {<fila CSV como dict>}
+         },
+         ...
+      }
+    }
+    o {} si no existe.
+    """
     if not _BUCKET or not _OBJECT:
         return {}
     cli = _client()
@@ -28,7 +45,9 @@ def load_state() -> Dict[str, Any]:
         pass
     return {}
 
+
 def save_state(state: Dict[str, Any]) -> None:
+    """Guarda el manifest actual en GCS."""
     if not _BUCKET or not _OBJECT:
         return
     cli = _client()
