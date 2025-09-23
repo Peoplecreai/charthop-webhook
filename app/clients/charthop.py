@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import hashlib
 import time
 from typing import Dict, Iterable, Iterator, List, Optional
 
@@ -18,12 +20,13 @@ from app.utils.config import (
     ch_headers,
 )
 
-# ---------- Utilidades internas ----------
+# =========================
+#   HTTP helpers
+# =========================
 
 def _new_session() -> Session:
     s = Session()
     s.headers.update(ch_headers())
-    # pool chico pero estable; reintentos manejados a mano
     adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
@@ -55,19 +58,20 @@ def _get_json(session: Session, url: str, params: Dict[str, str], max_retries: i
                     except ValueError as exc:
                         attempt += 1
                         last_exc = exc
-
         if attempt > max_retries:
             raise RuntimeError(f"ChartHop request failed after retries: {last_exc}") from last_exc
         time.sleep(min(2 ** (attempt - 1), 30))
 
 
-# ---------- Iteradores v2 (person) con cursor ----------
+# =========================
+#   People (v2) + cursor
+# =========================
 
-# Campos que necesitamos para Culture Amp, usando rutas con punto (v2)
+# Campos proyectados desde /v2/org/{org}/person (con rutas de punto)
 PEOPLE_FIELDS = ",".join(
     [
-        "id",                          # backup Employee Id
-        "contact.employee",            # preferred Employee Id (si lo tienen)
+        "id",                          # CH person id (para lookups)
+        "contact.employee",            # Employee Id preferido
         "jobId",                       # para Employment Type
         "contact.workEmail",
         "manager.contact.workEmail",
@@ -86,6 +90,10 @@ PEOPLE_FIELDS = ",".join(
 )
 
 def ch_iter_people_v2(fields: str = PEOPLE_FIELDS, page_size: Optional[int] = None) -> Iterator[Dict]:
+    """
+    Itera personas 'vigentes' (includeAll=false) paginando con cursor `next`.
+    Devuelve dicts con claves "aplanadas" (ChartHop v2 retorna keys con punto).
+    """
     url = f"{CH_API}/v2/org/{CH_ORG_ID}/person"
     session = _new_session()
     limit = page_size or CH_PEOPLE_PAGE_SIZE or 200
@@ -95,37 +103,40 @@ def ch_iter_people_v2(fields: str = PEOPLE_FIELDS, page_size: Optional[int] = No
     offset: Optional[str] = None
     seen_offsets = set()
 
-    while True:
-        params = {
-            "fields": fields,
-            "limit": str(limit),
-            # includeAll=false => solo plantilla vigente (evita históricos/terminados)
-            "includeAll": "false",
-        }
-        if offset:
-            if offset in seen_offsets:
-                # Evita loops si el cursor se repite
+    try:
+        while True:
+            params = {
+                "fields": fields,
+                "limit": str(limit),
+                "includeAll": "false",
+            }
+            if offset:
+                if offset in seen_offsets:
+                    break
+                params["offset"] = offset
+
+            payload = _get_json(session, url, params)
+            data = payload.get("data") or []
+            if isinstance(data, dict):
+                data = [data]
+            if not data:
                 break
-            params["offset"] = offset
 
-        payload = _get_json(session, url, params)
-        data = payload.get("data") or []
-        if isinstance(data, dict):
-            data = [data]
-        if not data:
-            break
+            for item in data:
+                yield item
 
-        for item in data:
-            yield item
-
-        next_token = payload.get("next")
-        if not next_token:
-            break
-        seen_offsets.add(offset or "")
-        offset = str(next_token)
+            next_token = payload.get("next")
+            if not next_token:
+                break
+            seen_offsets.add(offset or "")
+            offset = str(next_token)
+    finally:
+        session.close()
 
 
-# ---------- Lookup de Employment Type desde Job ----------
+# =========================
+#   Job lookup (employment)
+# =========================
 
 def ch_get_job_employment(job_id: str, session: Optional[Session] = None) -> Optional[str]:
     if not job_id:
@@ -143,7 +154,9 @@ def ch_get_job_employment(job_id: str, session: Optional[Session] = None) -> Opt
             session.close()
 
 
-# ---------- Construcción de rows para Culture Amp ----------
+# =========================
+#   Culture Amp rows
+# =========================
 
 CULTURE_AMP_COLUMNS = [
     "Employee Id",
@@ -167,10 +180,19 @@ def _norm_date_str(s: Optional[str]) -> str:
         return s[:10]
     return s
 
-def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
+def _row_hash(row: dict) -> str:
     """
-    Devuelve rows ya mapeadas con los headers de Culture Amp.
-    Employment Type se resuelve por jobId con cache simple por proceso.
+    Hash estable para detectar cambios relevantes en Culture Amp.
+    Usa solo el contenido de la fila (orden de claves determinista).
+    """
+    canonical = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
+    """
+    Devuelve (row_CA, ch_person_id).
+    Employment Type se resuelve consultando Job una vez por jobId (cache local).
     """
     job_cache: Dict[str, Optional[str]] = {}
     session = _new_session()
@@ -185,6 +207,8 @@ def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
                 or (p.get("id") or "").strip()
                 or email
             )
+            ch_person_id = (p.get("id") or "").strip()
+
             pref_first = (p.get("name.pref") or "").strip()
             pref_last = (p.get("name.preflast") or "").strip()
             first = (p.get("name.first") or "").strip()
@@ -214,7 +238,7 @@ def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
             else:
                 employment = ""
 
-            yield {
+            row = {
                 "Employee Id": emp_id,
                 "Email": email,
                 "Name": name,
@@ -229,5 +253,29 @@ def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
                 "Country": country,
                 "Employment Type": employment,
             }
+            yield row, ch_person_id
     finally:
         session.close()
+
+
+def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
+    for row, _pid in iter_culture_amp_rows_with_ids():
+        yield row
+
+
+def build_culture_amp_rows() -> List[Dict[str, str]]:
+    return list(iter_culture_amp_rows())
+
+
+def culture_amp_csv_from_rows(rows: Iterable[Dict[str, str]]) -> str:
+    sio = io.StringIO()
+    writer = csv.DictWriter(
+        sio,
+        fieldnames=CULTURE_AMP_COLUMNS,
+        extrasaction="ignore",
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return sio.getvalue()
