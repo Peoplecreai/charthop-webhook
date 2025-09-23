@@ -176,7 +176,6 @@ def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
     session = _new_session()
     try:
         for p in ch_iter_people_v2(PEOPLE_FIELDS):
-            # Campos base (rutas con punto vienen "aplanadas" como claves con punto)
             email = (p.get("contact.workEmail") or "").strip()
             if not email:
                 continue
@@ -232,21 +231,3 @@ def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
             }
     finally:
         session.close()
-
-
-def build_culture_amp_rows() -> List[Dict[str, str]]:
-    return list(iter_culture_amp_rows())
-
-
-def culture_amp_csv_from_rows(rows: Iterable[Dict[str, str]]) -> str:
-    sio = io.StringIO()
-    writer = csv.DictWriter(
-        sio,
-        fieldnames=CULTURE_AMP_COLUMNS,
-        extrasaction="ignore",
-        lineterminator="\n",
-    )
-    writer.writeheader()
-    for row in rows:
-        writer.writerow(row)
-    return sio.getvalue()
