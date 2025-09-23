@@ -7,11 +7,10 @@ from typing import Dict, Iterable
 from app.clients.charthop import CULTURE_AMP_COLUMNS, iter_culture_amp_rows
 from app.clients.sftp import sftp_upload
 from app.utils.config import (
-    CA_SFTP_HOST,   # "secure.employee-import.integrations.cultureamp.com"
-    CA_SFTP_KEY,    # llave privada OpenSSH (PEM) asociada al usuario en CA
-    CA_SFTP_USER,   # ej. "creai"
+    CA_SFTP_HOST,   # secure.employee-import.integrations.cultureamp.com
+    CA_SFTP_USER,   # username provisto por CA
+    CA_SFTP_KEY,    # llave privada OpenSSH (PEM) desde Secret Manager
 )
-
 
 class _UTF8SFTPWriter:
     def __init__(self, handler):
@@ -25,7 +24,6 @@ class _UTF8SFTPWriter:
         self._handler.write(payload)
         self.bytes_written += len(payload)
         return len(data)
-
 
 def _stream_culture_amp_csv(rows: Iterable[Dict[str, str]], handler) -> Dict[str, int]:
     proxy = _UTF8SFTPWriter(handler)
@@ -43,14 +41,10 @@ def _stream_culture_amp_csv(rows: Iterable[Dict[str, str]], handler) -> Dict[str
     handler.flush()
     return {"rows": row_count, "bytes": proxy.bytes_written}
 
-
 def export_culture_amp_snapshot() -> dict:
     """
-    Exporta snapshot de empleados y lo sube a Culture Amp por SFTP.
-    - Autenticación: SOLO Key File (OpenSSH). No password.
-    - Directorio: raíz "/" (no se pueden crear carpetas).
-    - Operación: PUT del archivo final (no rename/move).
-    - Formato: CSV UTF-8, encabezados exactos.
+    Genera CSV con headers de Culture Amp y lo sube a la raíz por SFTP.
+    Auth con key file. Nombre fijo: /employees.csv
     """
     remote_path = "/employees.csv"
 
@@ -60,7 +54,6 @@ def export_culture_amp_snapshot() -> dict:
     except StopIteration:
         return {"rows": 0, "skipped": True, "remote_path": remote_path}
 
-    # Validación de credenciales obligatorias
     if not CA_SFTP_HOST or not CA_SFTP_USER or not CA_SFTP_KEY:
         raise RuntimeError("Credenciales SFTP incompletas: host, user y key son obligatorios")
 
@@ -70,13 +63,10 @@ def export_culture_amp_snapshot() -> dict:
         pkey_pem=CA_SFTP_KEY,
         remote_path=remote_path,
         writer=lambda handler: _stream_culture_amp_csv(chain((first_row,), rows_iter), handler),
-    )
-
-    stats = stats or {"rows": 0, "bytes": 0}
+    ) or {"rows": 0, "bytes": 0}
 
     return {
         "rows": stats["rows"],
         "bytes": stats.get("bytes", 0),
         "remote_path": remote_path,
-        "skipped": False,
     }

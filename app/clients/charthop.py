@@ -1,222 +1,149 @@
+from __future__ import annotations
+
 import csv
 import io
 import time
-from datetime import date, datetime
 from typing import Dict, Iterable, Iterator, List, Optional
 
-import requests
+from requests import Session
+from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import HTTPError, Timeout, SSLError
 
 from app.utils.config import (
     CH_API,
-    CH_CF_JOB_TT_ID_LABEL,
     CH_ORG_ID,
-    CORP_EMAIL_DOMAIN,
-    AUTO_ASSIGN_WORK_EMAIL,
+    CH_PEOPLE_PAGE_SIZE,
     HTTP_TIMEOUT,
     ch_headers,
-    compose_location,
-    derive_locale_timezone,
-    strip_accents_and_non_alnum,
 )
 
+# ---------- Utilidades internas ----------
 
-def ch_find_job(job_id: str, fields: Optional[str] = None) -> Optional[Dict]:
-    """Busca un Job por jobid usando el filtro q=jobid\\{id}."""
-    params: Dict[str, str] = {"q": f"jobid\\{job_id}"}
-    default_fields = ["title", "department name", "location name", "open"]
-    if CH_CF_JOB_TT_ID_LABEL:
-        default_fields.append(CH_CF_JOB_TT_ID_LABEL)
-    params["fields"] = fields or ",".join(default_fields)
-    try:
-        r = requests.get(
-            f"{CH_API}/v2/org/{CH_ORG_ID}/job",
-            headers=ch_headers(),
-            params=params,
-            timeout=HTTP_TIMEOUT,
-        )
-    except Exception as exc:  # pragma: no cover - logging
-        print("ch_find_job error:", repr(exc))
-        return None
-    if not r.ok:
-        print("ch_find_job status:", r.status_code, (r.text or "")[:200])
-        return None
-    items = (r.json() or {}).get("data") or []
-    return items[0] if items else None
+def _new_session() -> Session:
+    s = Session()
+    s.headers.update(ch_headers())
+    # pool chico pero estable; reintentos manejados a mano
+    adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
 
-def ch_upsert_job_field(job_id: str, field_label: str, value: str):
-    sio = io.StringIO()
-    writer = csv.DictWriter(sio, fieldnames=["job id", field_label])
-    writer.writeheader()
-    writer.writerow({"job id": job_id, field_label: value})
-    sio.seek(0)
-    files = {"file": ("jobs.csv", sio.read())}
-    url = f"{CH_API}/v1/org/{CH_ORG_ID}/import/csv/data"
-    params = {"upsert": "true"}
-    r = requests.post(
-        url,
-        headers=ch_headers(),
-        params=params,
-        files=files,
-        timeout=HTTP_TIMEOUT,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def ch_import_people_csv(rows: List[Dict]):
-    if not rows:
-        return {"status": "empty"}
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
-    output.seek(0)
-    files = {"file": ("people.csv", output.read())}
-    url = f"{CH_API}/v1/org/{CH_ORG_ID}/import/csv/data"
-    params = {"upsert": "true", "creategroups": "true"}
-    r = requests.post(
-        url,
-        headers=ch_headers(),
-        params=params,
-        files=files,
-        timeout=HTTP_TIMEOUT,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def ch_email_exists(email: str) -> bool:
-    if not email:
-        return False
-    try:
-        url = f"{CH_API}/v2/org/{CH_ORG_ID}/person"
-        params = {"q": f"contact workemail\\{email}", "fields": "contact workemail"}
-        r = requests.get(url, headers=ch_headers(), params=params, timeout=HTTP_TIMEOUT)
-        if not r.ok:
-            return False
-        for item in (r.json() or {}).get("data", []):
-            fields = item.get("fields") or {}
-            work = (fields.get("contact workemail") or "").strip().lower()
-            if work == email.strip().lower():
-                return True
-    except Exception as exc:  # pragma: no cover - logging
-        print("ch_email_exists error:", repr(exc))
-    return False
-
-
-def generate_unique_work_email(first: str, last: str) -> Optional[str]:
-    if not AUTO_ASSIGN_WORK_EMAIL or not CORP_EMAIL_DOMAIN:
-        return None
-    base_local = f"{strip_accents_and_non_alnum(first)}{strip_accents_and_non_alnum(last)}"
-    if not base_local:
-        return None
-    candidate = f"{base_local}@{CORP_EMAIL_DOMAIN}"
-    if not ch_email_exists(candidate):
-        return candidate
-    for i in range(2, 100):
-        candidate = f"{base_local}{i}@{CORP_EMAIL_DOMAIN}"
-        if not ch_email_exists(candidate):
-            return candidate
-    return None
-
-
-def ch_iter_people(fields: str, limit: int = 200, max_retries: int = 5) -> Iterator[Dict]:
-    offset = 0
+def _get_json(session: Session, url: str, params: Dict[str, str], max_retries: int = 5) -> Dict:
+    attempt = 0
+    last_exc: Optional[Exception] = None
     while True:
-        params = {"fields": fields, "limit": limit, "offset": offset}
-        attempt = 0
-        while True:
-            try:
-                r = requests.get(
-                    f"{CH_API}/v2/org/{CH_ORG_ID}/person",
-                    headers=ch_headers(),
-                    params=params,
-                    timeout=HTTP_TIMEOUT,
-                )
-                r.raise_for_status()
-                break
-            except Exception as exc:  # pragma: no cover - logging
+        try:
+            r = session.get(url, params=params, timeout=HTTP_TIMEOUT)
+        except (RequestsConnectionError, Timeout, SSLError) as exc:
+            attempt += 1
+            last_exc = exc
+        else:
+            if r.status_code == 429:
                 attempt += 1
-                if attempt > max_retries:
-                    print("ch_iter_people error:", repr(exc))
-                    return
-                sleep_for = min(2 ** (attempt - 1), 30)
-                time.sleep(sleep_for)
-        payload = r.json() or {}
+                last_exc = HTTPError("429 Too Many Requests", response=r)
+            else:
+                try:
+                    r.raise_for_status()
+                except HTTPError as exc:
+                    attempt += 1
+                    last_exc = exc
+                else:
+                    try:
+                        return r.json() or {}
+                    except ValueError as exc:
+                        attempt += 1
+                        last_exc = exc
+
+        if attempt > max_retries:
+            raise RuntimeError(f"ChartHop request failed after retries: {last_exc}") from last_exc
+        time.sleep(min(2 ** (attempt - 1), 30))
+
+
+# ---------- Iteradores v2 (person) con cursor ----------
+
+# Campos que necesitamos para Culture Amp, usando rutas con punto (v2)
+PEOPLE_FIELDS = ",".join(
+    [
+        "id",                          # backup Employee Id
+        "contact.employee",            # preferred Employee Id (si lo tienen)
+        "jobId",                       # para Employment Type
+        "contact.workEmail",
+        "manager.contact.workEmail",
+        "name.first",
+        "name.last",
+        "name.pref",
+        "name.preflast",
+        "address.city",
+        "address.country",
+        "title",
+        "seniority",
+        "startDateOrg",
+        "endDateOrg",
+        "department.name",
+    ]
+)
+
+def ch_iter_people_v2(fields: str = PEOPLE_FIELDS, page_size: Optional[int] = None) -> Iterator[Dict]:
+    url = f"{CH_API}/v2/org/{CH_ORG_ID}/person"
+    session = _new_session()
+    limit = page_size or CH_PEOPLE_PAGE_SIZE or 200
+    if limit <= 0:
+        limit = 200
+
+    offset: Optional[str] = None
+    seen_offsets = set()
+
+    while True:
+        params = {
+            "fields": fields,
+            "limit": str(limit),
+            # includeAll=false => solo plantilla vigente (evita históricos/terminados)
+            "includeAll": "false",
+        }
+        if offset:
+            if offset in seen_offsets:
+                # Evita loops si el cursor se repite
+                break
+            params["offset"] = offset
+
+        payload = _get_json(session, url, params)
         data = payload.get("data") or []
         if isinstance(data, dict):
             data = [data]
         if not data:
-            return
+            break
+
         for item in data:
             yield item
-        offset += len(data)
+
+        next_token = payload.get("next")
+        if not next_token:
+            break
+        seen_offsets.add(offset or "")
+        offset = str(next_token)
 
 
-def ch_active_people(fields: str) -> Iterator[Dict]:
-    for item in ch_iter_people(fields):
-        fields_map = item.get("fields") or {}
-        status = (fields_map.get("status") or "").strip().lower()
-        if status and status not in {"active", "current", "enabled"}:
-            continue
-        yield item
+# ---------- Lookup de Employment Type desde Job ----------
 
-
-def ch_people_starting_between(start: date, end: date, fields: Optional[str] = None) -> List[Dict]:
-    fields = fields or "person id,name first,name last,contact workemail,contact personalemail,start date,title"
-    people = []
-    for item in ch_active_people(fields + ",status"):
-        flds = item.get("fields") or {}
-        start_raw = (flds.get("start date") or flds.get("startdate") or "").strip()
-        if not start_raw:
-            continue
-        try:
-            start_dt = datetime.strptime(start_raw[:10], "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if start <= start_dt <= end:
-            people.append(item)
-    return people
-
-
-def ch_fetch_timeoff(start: date, end: date) -> List[Dict]:
-    url = f"{CH_API}/v2/org/{CH_ORG_ID}/timeoff"
-    params = {
-        "startDate": start.isoformat(),
-        "endDate": end.isoformat(),
-        "fields": "person id,person name,person contact workemail,start date,end date,type,reason,status",
-    }
+def ch_get_job_employment(job_id: str, session: Optional[Session] = None) -> Optional[str]:
+    if not job_id:
+        return None
+    own = False
+    if session is None:
+        session = _new_session()
+        own = True
     try:
-        r = requests.get(url, headers=ch_headers(), params=params, timeout=HTTP_TIMEOUT)
-        if not r.ok:
-            print("ch_fetch_timeoff status:", r.status_code, (r.text or "")[:200])
-            return []
-        payload = r.json() or {}
-        data = payload.get("data")
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return [data]
-    except Exception as exc:  # pragma: no cover - logging
-        print("ch_fetch_timeoff error:", repr(exc))
-    return []
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        payload = _get_json(session, url, {"fields": "employment"})
+        return (payload or {}).get("employment") or None
+    finally:
+        if own:
+            session.close()
 
 
-def _norm_date(s: str) -> str:
-    """Normaliza a YYYY-MM-DD si viene en formato ISO; en otros casos la deja tal cual."""
-    s = (s or "").strip()
-    if not s:
-        return ""
-    try:
-        return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
-    except ValueError:
-        return s
-
-
-def build_culture_amp_rows() -> List[Dict[str, str]]:
-    return list(iter_culture_amp_rows())
-
+# ---------- Construcción de rows para Culture Amp ----------
 
 CULTURE_AMP_COLUMNS = [
     "Employee Id",
@@ -234,105 +161,73 @@ CULTURE_AMP_COLUMNS = [
     "Employment Type",
 ]
 
+def _norm_date_str(s: Optional[str]) -> str:
+    s = (s or "").strip()
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return s
 
 def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
-    fields = ",".join(
-        [
-            "employee id",                # preferido para Employee Id
-            "person id",                  # fallback
-            "name first",
-            "name last",
-            "preferred name first",
-            "preferred name last",        # NUEVO: para armar Name con preferred
-            "contact workemail",
-            "contact personalemail",
-            "manager contact workemail",
-            "title",
-            "seniority",
-            "homeaddress country",
-            "homeaddress region",
-            "homeaddress city",           # NUEVO: Location = ciudad
-            "status",
-            "start date",                 # Start Date
-            "end date",                   # End Date
-            "department",                 # Department
-            "department name",            # fallback
-            "employment",                 # Employment Type
-        ]
-    )
-    for person in ch_active_people(fields):
-        flds = person.get("fields") or {}
+    """
+    Devuelve rows ya mapeadas con los headers de Culture Amp.
+    Employment Type se resuelve por jobId con cache simple por proceso.
+    """
+    job_cache: Dict[str, Optional[str]] = {}
+    session = _new_session()
+    try:
+        for p in ch_iter_people_v2(PEOPLE_FIELDS):
+            email = (p.get("contact.workEmail") or "").strip()
+            if not email:
+                continue
 
-        work = (flds.get("contact workemail") or "").strip()
-        if not work:
-            continue
+            emp_id = (
+                (p.get("contact.employee") or "").strip()
+                or (p.get("id") or "").strip()
+                or email
+            )
+            pref_first = (p.get("name.pref") or "").strip()
+            pref_last = (p.get("name.preflast") or "").strip()
+            first = (p.get("name.first") or "").strip()
+            last = (p.get("name.last") or "").strip()
 
-        # Name: preferidos primero (first + last), luego first/last normales
-        pref_first = (flds.get("preferred name first") or "").strip()
-        pref_last = (flds.get("preferred name last") or "").strip()
-        first = (flds.get("name first") or "").strip()
-        last = (flds.get("name last") or "").strip()
+            if pref_first or pref_last:
+                name = f"{pref_first} {pref_last}".strip()
+            else:
+                name = f"{first} {last}".strip()
 
-        if pref_first or pref_last:
-            name = " ".join(p for p in [pref_first, pref_last] if p).strip()
-        else:
-            name = " ".join(p for p in [first, last] if p).strip()
+            manager_email = (p.get("manager.contact.workEmail") or "").strip()
+            city = (p.get("address.city") or "").strip()
+            country = (p.get("address.country") or "").strip()
+            title = (p.get("title") or "").strip()
+            seniority = (p.get("seniority") or "").strip()
+            start_date = _norm_date_str(p.get("startDateOrg"))
+            end_date = _norm_date_str(p.get("endDateOrg"))
+            department = (p.get("department.name") or "").strip()
 
-        # Preferred Name (sigue siendo preferred first)
-        preferred_display = pref_first
+            job_id = (p.get("jobId") or "").strip()
+            if job_id:
+                if job_id in job_cache:
+                    employment = job_cache[job_id] or ""
+                else:
+                    employment = ch_get_job_employment(job_id, session=session) or ""
+                    job_cache[job_id] = employment
+            else:
+                employment = ""
 
-        # Location: solo la ciudad del home address
-        city = (flds.get("homeaddress city") or "").strip()
-
-        # Employee Id preferido, luego person id, luego email
-        employee_id = (
-            (flds.get("employee id") or "").strip()
-            or (flds.get("person id") or "").strip()
-            or work
-        )
-
-        start_raw = (flds.get("start date") or flds.get("startdate") or "").strip()
-        end_raw = (flds.get("end date") or flds.get("enddate") or "").strip()
-        department = (flds.get("department") or flds.get("department name") or "").strip()
-        country = (flds.get("homeaddress country") or "").strip()
-        employment = (flds.get("employment") or "").strip()
-        region = (flds.get("homeaddress region") or "").strip()  # se mantiene por si lo usas en otra parte
-
-        yield {
-            "Employee Id": employee_id,
-            "Email": work,
-            "Name": name,
-            "Preferred Name": preferred_display,
-            "Manager Email": flds.get("manager contact workemail") or "",
-            "Location": city,
-            "Job Title": flds.get("title") or "",
-            "Seniority": flds.get("seniority") or "",
-            "Start Date": _norm_date(start_raw),
-            "End Date": _norm_date(end_raw),
-            "Department": department,
-            "Country": country,
-            "Employment Type": employment,
-        }
-
-
-def culture_amp_csv_from_rows(rows: Iterable[Dict[str, str]]) -> str:
-    sio = io.StringIO()
-    writer = csv.DictWriter(
-        sio,
-        fieldnames=CULTURE_AMP_COLUMNS,
-        extrasaction="ignore",
-        lineterminator="\n",
-    )
-    writer.writeheader()
-    for row in rows:
-        writer.writerow(row)
-    return sio.getvalue()
-
-
-def ch_person_primary_email(person: Dict) -> Optional[str]:
-    flds = (person or {}).get("fields") or {}
-    work = (flds.get("contact workemail") or "").strip()
-    if work:
-        return work
-    personal = (flds.get("contact personalemail") or "").strip()
-    return personal or None
+            yield {
+                "Employee Id": emp_id,
+                "Email": email,
+                "Name": name,
+                "Preferred Name": pref_first,
+                "Manager Email": manager_email,
+                "Location": city,
+                "Job Title": title,
+                "Seniority": seniority,
+                "Start Date": start_date,
+                "End Date": end_date,
+                "Department": department,
+                "Country": country,
+                "Employment Type": employment,
+            }
+    finally:
+        session.close()

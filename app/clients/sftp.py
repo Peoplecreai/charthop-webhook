@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import io
 import os
 import socket
@@ -5,13 +7,7 @@ from typing import Callable, Optional, TypeVar, Union
 
 import paramiko
 
-
 def _sftp_ensure_dirs(sftp: paramiko.SFTPClient, remote_dir: str):
-    """
-    Culture Amp solo permite subir a '/', no crear directorios.
-    Esta función hace no-op si remote_dir es '/' o vacío.
-    La dejamos genérica por si reusas este cliente con otros SFTP.
-    """
     if not remote_dir or remote_dir == "/":
         return
     parts = []
@@ -23,40 +19,35 @@ def _sftp_ensure_dirs(sftp: paramiko.SFTPClient, remote_dir: str):
         except FileNotFoundError:
             sftp.mkdir(path)
 
-
 T = TypeVar("T")
-
 
 def sftp_upload(
     *,
     host: str,
     username: str,
-    password: Optional[str] = None,
-    pkey_pem: Optional[str] = None,
-    passphrase: Optional[str] = None,
     remote_path: str,
     content: Optional[Union[str, bytes]] = None,
     writer: Optional[Callable[[paramiko.SFTPFile], T]] = None,
+    pkey_pem: Optional[str] = None,
+    password: Optional[str] = None,
+    passphrase: Optional[str] = None,
 ) -> Optional[T]:
     """
-    Sube 'content' vía SFTP como archivo en 'remote_path'.
-    - Admite auth por password o por llave (preferida para Culture Amp).
-    - 'content' puede ser str (se codifica UTF-8) o bytes.
-    - Alternativamente, se puede proveer 'writer', un callback que recibe el handler
-      abierto y devuelve un resultado opcional (por ejemplo, métricas de subida).
+    Sube contenido vía SFTP como archivo en 'remote_path'.
+    Admite auth con password o con llave (recomendado).
+    Puedes pasar 'content' (str/bytes) o un 'writer(handler) -> T'.
     """
     if not host or not username:
         raise RuntimeError("SFTP requiere host y username configurados")
-
     if content is None and writer is None:
         raise ValueError("sftp_upload requiere 'content' o 'writer'")
     if content is not None and writer is not None:
         raise ValueError("sftp_upload no acepta 'content' y 'writer' al mismo tiempo")
 
-    # Conexión TCP al puerto 22 con timeout corto para evitar cuelgues
     sock = socket.create_connection((host.rstrip("."), 22), timeout=15)
     transport = paramiko.Transport(sock)
     transport.banner_timeout = 15
+
     key = None
     try:
         if pkey_pem:
@@ -94,5 +85,5 @@ def sftp_upload(
     finally:
         try:
             sock.close()
-        except Exception:  # pragma: no cover - logging
+        except Exception:
             pass
