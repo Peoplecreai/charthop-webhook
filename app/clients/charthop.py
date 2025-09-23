@@ -1,5 +1,6 @@
 import csv
 import io
+import time
 from datetime import date, datetime
 from typing import Dict, Iterable, Iterator, List, Optional
 
@@ -120,23 +121,32 @@ def generate_unique_work_email(first: str, last: str) -> Optional[str]:
     return None
 
 
-def ch_iter_people(fields: str, limit: int = 200) -> Iterator[Dict]:
+def ch_iter_people(fields: str, limit: int = 200, max_retries: int = 5) -> Iterator[Dict]:
     offset = 0
     while True:
         params = {"fields": fields, "limit": limit, "offset": offset}
-        try:
-            r = requests.get(
-                f"{CH_API}/v2/org/{CH_ORG_ID}/person",
-                headers=ch_headers(),
-                params=params,
-                timeout=HTTP_TIMEOUT,
-            )
-            r.raise_for_status()
-        except Exception as exc:  # pragma: no cover - logging
-            print("ch_iter_people error:", repr(exc))
-            return
+        attempt = 0
+        while True:
+            try:
+                r = requests.get(
+                    f"{CH_API}/v2/org/{CH_ORG_ID}/person",
+                    headers=ch_headers(),
+                    params=params,
+                    timeout=HTTP_TIMEOUT,
+                )
+                r.raise_for_status()
+                break
+            except Exception as exc:  # pragma: no cover - logging
+                attempt += 1
+                if attempt > max_retries:
+                    print("ch_iter_people error:", repr(exc))
+                    return
+                sleep_for = min(2 ** (attempt - 1), 30)
+                time.sleep(sleep_for)
         payload = r.json() or {}
         data = payload.get("data") or []
+        if isinstance(data, dict):
+            data = [data]
         if not data:
             return
         for item in data:
@@ -144,15 +154,13 @@ def ch_iter_people(fields: str, limit: int = 200) -> Iterator[Dict]:
         offset += len(data)
 
 
-def ch_active_people(fields: str) -> List[Dict]:
-    rows: List[Dict] = []
+def ch_active_people(fields: str) -> Iterator[Dict]:
     for item in ch_iter_people(fields):
         fields_map = item.get("fields") or {}
         status = (fields_map.get("status") or "").strip().lower()
         if status and status not in {"active", "current", "enabled"}:
             continue
-        rows.append(item)
-    return rows
+        yield item
 
 
 def ch_people_starting_between(start: date, end: date, fields: Optional[str] = None) -> List[Dict]:
@@ -207,6 +215,27 @@ def _norm_date(s: str) -> str:
 
 
 def build_culture_amp_rows() -> List[Dict[str, str]]:
+    return list(iter_culture_amp_rows())
+
+
+CULTURE_AMP_COLUMNS = [
+    "Employee Id",
+    "Email",
+    "Name",
+    "Preferred Name",
+    "Manager Email",
+    "Location",
+    "Job Title",
+    "Seniority",
+    "Start Date",
+    "End Date",
+    "Department",
+    "Country",
+    "Employment Type",
+]
+
+
+def iter_culture_amp_rows() -> Iterator[Dict[str, str]]:
     fields = ",".join(
         [
             "employee id",                # preferido para Employee Id
@@ -231,7 +260,6 @@ def build_culture_amp_rows() -> List[Dict[str, str]]:
             "employment",                 # Employment Type
         ]
     )
-    rows: List[Dict[str, str]] = []
     for person in ch_active_people(fields):
         flds = person.get("fields") or {}
 
@@ -270,44 +298,31 @@ def build_culture_amp_rows() -> List[Dict[str, str]]:
         employment = (flds.get("employment") or "").strip()
         region = (flds.get("homeaddress region") or "").strip()  # se mantiene por si lo usas en otra parte
 
-        rows.append(
-            {
-                "Employee Id": employee_id,
-                "Email": work,
-                "Name": name,
-                "Preferred Name": preferred_display,
-                "Manager Email": flds.get("manager contact workemail") or "",
-                "Location": city,
-                "Job Title": flds.get("title") or "",
-                "Seniority": flds.get("seniority") or "",
-                "Start Date": _norm_date(start_raw),
-                "End Date": _norm_date(end_raw),
-                "Department": department,
-                "Country": country,
-                "Employment Type": employment,
-            }
-        )
-    return rows
+        yield {
+            "Employee Id": employee_id,
+            "Email": work,
+            "Name": name,
+            "Preferred Name": preferred_display,
+            "Manager Email": flds.get("manager contact workemail") or "",
+            "Location": city,
+            "Job Title": flds.get("title") or "",
+            "Seniority": flds.get("seniority") or "",
+            "Start Date": _norm_date(start_raw),
+            "End Date": _norm_date(end_raw),
+            "Department": department,
+            "Country": country,
+            "Employment Type": employment,
+        }
 
 
 def culture_amp_csv_from_rows(rows: Iterable[Dict[str, str]]) -> str:
-    columns = [
-        "Employee Id",
-        "Email",
-        "Name",
-        "Preferred Name",
-        "Manager Email",
-        "Location",
-        "Job Title",
-        "Seniority",
-        "Start Date",
-        "End Date",
-        "Department",
-        "Country",
-        "Employment Type",
-    ]
     sio = io.StringIO()
-    writer = csv.DictWriter(sio, fieldnames=columns, extrasaction="ignore")
+    writer = csv.DictWriter(
+        sio,
+        fieldnames=CULTURE_AMP_COLUMNS,
+        extrasaction="ignore",
+        lineterminator="\n",
+    )
     writer.writeheader()
     for row in rows:
         writer.writerow(row)
