@@ -14,16 +14,16 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import HTTPError, Timeout, SSLError
 
-from app.utils.config import (
-    AUTO_ASSIGN_WORK_EMAIL,
-    CH_API,
-    CH_ORG_ID,
-    CH_PEOPLE_PAGE_SIZE,
-    CORP_EMAIL_DOMAIN,
-    HTTP_TIMEOUT,
-    ch_headers,
-    strip_accents_and_non_alnum,
-)
+from app.utils import config as _config
+
+AUTO_ASSIGN_WORK_EMAIL = _config.AUTO_ASSIGN_WORK_EMAIL
+CH_API = _config.CH_API
+CH_ORG_ID = _config.CH_ORG_ID
+CH_PEOPLE_PAGE_SIZE = getattr(_config, "CH_PEOPLE_PAGE_SIZE", 200)
+CORP_EMAIL_DOMAIN = _config.CORP_EMAIL_DOMAIN
+HTTP_TIMEOUT = _config.HTTP_TIMEOUT
+ch_headers = _config.ch_headers
+strip_accents_and_non_alnum = _config.strip_accents_and_non_alnum
 
 # =========================
 #   HTTP helpers
