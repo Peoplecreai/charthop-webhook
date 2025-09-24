@@ -105,20 +105,22 @@ def ch_iter_people_v2(fields: str = PEOPLE_FIELDS, page_size: Optional[int] = No
     if limit <= 0:
         limit = 200
 
-    offset: Optional[str] = None
-    seen_offsets = set()
+    cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
 
     try:
         while True:
             params = {
                 "fields": fields,
-                "limit": str(limit),
-                "includeAll": "false",
+                "limit": limit,
+                "includeAll": False,
             }
-            if offset:
-                if offset in seen_offsets:
+            if cursor:
+                if cursor in seen_cursors:
                     break
-                params["offset"] = offset
+                # ChartHop v2 person listing (see /v2/org/{orgId}/person in the swagger)
+                # uses the `from` query parameter to continue pagination.
+                params["from"] = cursor
 
             payload = _get_json(session, url, params)
             data = payload.get("data") or []
@@ -133,8 +135,8 @@ def ch_iter_people_v2(fields: str = PEOPLE_FIELDS, page_size: Optional[int] = No
             next_token = payload.get("next")
             if not next_token:
                 break
-            seen_offsets.add(offset or "")
-            offset = str(next_token)
+            seen_cursors.add(cursor or "")
+            cursor = str(next_token)
     finally:
         session.close()
 
