@@ -4,6 +4,7 @@ from app.blueprints.charthop_webhook import bp_ch, ch_webhook as ch_handler
 from app.blueprints.teamtailor_webhook import bp_tt, tt_webhook as tt_handler
 from app.blueprints.cron import bp_cron
 from app.tasks.ca_export import bp_tasks  # <-- nuevo
+from app.tasks import runn_export  # noqa: F401  # ensures /tasks/export-runn is registered
 
 app = Flask(__name__)
 app.register_blueprint(bp_ch)
