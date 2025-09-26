@@ -1,4 +1,7 @@
-**/__pycache__
-*.pyc
 .git
-
+__pycache__/
+*.pyc
+.venv
+.env
+.env.*
+.cache
