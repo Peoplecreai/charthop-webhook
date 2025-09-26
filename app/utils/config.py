@@ -88,6 +88,7 @@ def runn_headers():
     return {
         "Authorization": f"Bearer {RUNN_API_TOKEN}",
         "Accept-Version": RUNN_API_VERSION,
+        "Accept": "application/json",
         "Content-Type": "application/json",
     }
 
