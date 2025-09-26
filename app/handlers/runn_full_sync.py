@@ -129,8 +129,20 @@ def _merge_upsert(client: bigquery.Client, resource: str, rows: List[Dict[str, A
     )
     job.result()
 
+    target_schema = client.get_table(table).schema
+    staging_schema = {field.name for field in client.get_table(staging).schema}
+    columns = [field.name for field in target_schema if field.name in staging_schema]
+
+    if not columns:
+        return {"inserted": 0, "merged": 0, "table": table}
+
     pk = cfg["pk"]
     ts = cfg["ts"]
+
+    assignments = ",\n        ".join(f"T.{col} = S.{col}" for col in columns)
+    insert_columns = ", ".join(columns)
+    insert_values = ", ".join(f"S.{col}" for col in columns)
+
     # Si no hay updatedAt en el recurso, comparamos contra NULL => siempre inserta/actualiza
     merge_sql = f"""
     MERGE `{table}` T
@@ -139,8 +151,9 @@ def _merge_upsert(client: bigquery.Client, resource: str, rows: List[Dict[str, A
     WHEN MATCHED AND (
         SAFE.TIMESTAMP(S.{ts}) > SAFE.TIMESTAMP(T.{ts})
         OR T.{ts} IS NULL OR S.{ts} IS NULL
-    ) THEN UPDATE SET T = S
-    WHEN NOT MATCHED THEN INSERT ROW
+    ) THEN UPDATE SET
+        {assignments}
+    WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})
     """
     q = client.query(merge_sql, location=BQ_LOCATION); q.result()
     try:
