@@ -130,6 +130,7 @@ def _merge_upsert(client: bigquery.Client, resource: str, rows: List[Dict[str, A
     job.result()
 
     target_schema = client.get_table(table).schema
+    schema_map = {field.name: field for field in target_schema}
     staging_schema = {field.name for field in client.get_table(staging).schema}
     columns = [field.name for field in target_schema if field.name in staging_schema]
 
@@ -139,9 +140,14 @@ def _merge_upsert(client: bigquery.Client, resource: str, rows: List[Dict[str, A
     pk = cfg["pk"]
     ts = cfg["ts"]
 
-    assignments = ",\n        ".join(f"T.{col} = S.{col}" for col in columns)
+    assignments = ",\n        ".join(
+        f"T.{col} = SAFE_CAST(S.{col} AS {schema_map[col].field_type})"
+        for col in columns
+    )
     insert_columns = ", ".join(columns)
-    insert_values = ", ".join(f"S.{col}" for col in columns)
+    insert_values = ", ".join(
+        f"SAFE_CAST(S.{col} AS {schema_map[col].field_type})" for col in columns
+    )
 
     # Si no hay updatedAt en el recurso, comparamos contra NULL => siempre inserta/actualiza
     merge_sql = f"""
@@ -155,6 +161,7 @@ def _merge_upsert(client: bigquery.Client, resource: str, rows: List[Dict[str, A
         {assignments}
     WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})
     """
+    print(f"[runn_full_sync] MERGE {resource} -> {table} columns={columns}")
     q = client.query(merge_sql, location=BQ_LOCATION); q.result()
     try:
         client.delete_table(staging, not_found_ok=True)
