@@ -23,8 +23,12 @@ def _daterange(window_days: int):
     frm = to - datetime.timedelta(days=window_days)
     return frm.isoformat(), to.isoformat()
 
-def _fetch_actuals(token: str, min_date: str, max_date: str):
-    url = f"{RUNN_API}/actuals"
+def _actuals_url() -> str:
+    return f"{RUNN_API.rstrip('/')}/actuals"
+
+
+def _fetch_actuals_cursor(token: str, min_date: str, max_date: str):
+    url = _actuals_url()
     cursor = None
     session = requests.Session()
     out = []
@@ -45,6 +49,47 @@ def _fetch_actuals(token: str, min_date: str, max_date: str):
         if not cursor:
             break
     return out
+
+
+def _fetch_actuals_paginated(token: str, min_date: str, max_date: str):
+    url = _actuals_url()
+    session = requests.Session()
+    out = []
+    page = 1
+    while True:
+        params = {
+            "from": min_date,
+            "to": max_date,
+            "page": page,
+            "per_page": 200,
+        }
+        r = session.get(url, headers=_headers(token), params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            items = data
+            metadata = {}
+        else:
+            items = data.get("values") or data.get("items") or data.get("data") or []
+            metadata = data if isinstance(data, dict) else {}
+        if not items:
+            break
+        out.extend(items)
+        page += 1
+        total_pages = metadata.get("total_pages") or metadata.get("totalPages")
+        if total_pages and page > int(total_pages):
+            break
+    return out
+
+
+def _fetch_actuals(token: str, min_date: str, max_date: str):
+    try:
+        return _fetch_actuals_cursor(token, min_date, max_date)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status in {400, 404, 422}:
+            return _fetch_actuals_paginated(token, min_date, max_date)
+        raise
 
 def _ensure_table():
     client = bigquery.Client(project=BQ_PROJECT, location=BQ_LOCATION)
