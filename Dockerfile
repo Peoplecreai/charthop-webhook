@@ -18,4 +18,4 @@ COPY handlers/ handlers/
 ENV PYTHONPATH=/app
 
 # gunicorn según tu estructura: app/main.py expone "app"
-CMD ["gunicorn", "-b", ":$PORT", "app.main:app"]
+CMD ["gunicorn", "-b", "8080", "app.main:app"]
