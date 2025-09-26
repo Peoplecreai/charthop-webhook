@@ -12,6 +12,7 @@ import at start-up.
 from __future__ import annotations
 
 from importlib import import_module
+import logging
 import os
 from typing import Any, Callable, Dict, Optional
 
@@ -72,7 +73,19 @@ def export_runn_snapshot(*, window_days: int = 120) -> Dict[str, Any]:
         configured.
     """
 
-    handler = _resolve_handler()
+    try:
+        handler = _resolve_handler()
+    except Exception as error:  # pragma: no cover - defensive guard
+        logging.getLogger(__name__).exception(
+            "No se pudo resolver RUNN_EXPORT_HANDLER"
+        )
+        return {
+            "ok": False,
+            "reason": "Error al resolver RUNN_EXPORT_HANDLER",
+            "details": str(error),
+            "window_days": window_days,
+        }
+
     if handler is None:
         return {
             "ok": False,
@@ -80,7 +93,19 @@ def export_runn_snapshot(*, window_days: int = 120) -> Dict[str, Any]:
             "window_days": window_days,
         }
 
-    result = handler(window_days=window_days)
+    try:
+        result = handler(window_days=window_days)
+    except Exception as error:  # pragma: no cover - defensive guard
+        logging.getLogger(__name__).exception(
+            "Fallo la ejecución del handler RUNN_EXPORT_HANDLER"
+        )
+        return {
+            "ok": False,
+            "reason": "Error al ejecutar RUNN_EXPORT_HANDLER",
+            "details": str(error),
+            "window_days": window_days,
+        }
+
     if isinstance(result, dict):
         return result
     return {"ok": True, "result": result, "window_days": window_days}
