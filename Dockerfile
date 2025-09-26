@@ -12,10 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # código
 COPY app/ app/
 COPY handlers/ handlers/
-# (si tienes otros módulos, añádelos)
 
-# por si el import busca desde /app
+# para imports relativos desde /app
 ENV PYTHONPATH=/app
 
 # gunicorn según tu estructura: app/main.py expone "app"
-CMD ["gunicorn", "-b", "8080", "app.main:app"]
+CMD ["gunicorn", "-b", ":8080", "app.main:app"]
