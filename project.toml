@@ -7,5 +7,9 @@ name = "GOOGLE_RUNTIME"
 value = "python311"
 
 [[build.env]]
+name = "GOOGLE_BUILDABLE"
+value = "."
+
+[[build.env]]
 name = "GOOGLE_ENTRYPOINT"
-value = "gunicorn -b :$PORT main:app"
+value = "gunicorn -b :$PORT app.main:app"
