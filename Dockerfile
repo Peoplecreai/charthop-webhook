@@ -16,8 +16,7 @@ CMD ["python", "-m", "app.main"]
  COPY requirements.txt .
  RUN pip install --no-cache-dir -r requirements.txt
 
- COPY app ./app
-+COPY handlers ./handlers
+ COPY handlers ./handlers
 
  ENV PORT=8080
  CMD ["python", "-m", "app.main"]
