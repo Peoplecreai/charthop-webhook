@@ -1,88 +1,99 @@
-"""Handlers for exporting RUNN actuals to BigQuery."""
-
-import datetime
-import os
-from typing import Any
-
-import requests
+# handlers/runn_to_bq.py
+import os, datetime, requests
 from google.cloud import bigquery
 
+RUNN_API = os.environ.get("RUNN_API", "https://api.runn.io")
+RUNN_API_VERSION = os.environ.get("RUNN_API_VERSION", "1.0.0")
+BQ_PROJECT = os.environ["BQ_PROJECT"]
+BQ_DATASET = os.environ["BQ_DATASET"]
+BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "30"))
 
-def export_handler(window_days: int = 90, **_: Any) -> dict[str, Any]:
-    """Fetch RUNN actuals for the given window and load them into BigQuery."""
-    base = os.environ.get("RUNN_API", "https://api.runn.io").rstrip("/")
-    path = os.environ.get("RUNN_TIME_ENTRIES_PATH", "actuals").lstrip("/")
-    url = f"{base}/{path}"
+TABLE_ID = f"{BQ_PROJECT}.{BQ_DATASET}.runn_actuals"
 
-    token = os.environ["RUNN_API_TOKEN"]
-    headers = {
+def _headers(token: str):
+    return {
         "Authorization": f"Bearer {token}",
-        "Accept-Version": os.environ.get("RUNN_API_VERSION", "1.0.0"),
+        "Accept": "application/json",
+        "Accept-Version": RUNN_API_VERSION,
     }
 
-    today = datetime.date.today()
-    min_date = (today - datetime.timedelta(days=window_days)).isoformat()
-    max_date = today.isoformat()
+def _daterange(window_days: int):
+    to = datetime.date.today()
+    frm = to - datetime.timedelta(days=window_days)
+    return frm.isoformat(), to.isoformat()
 
-    rows: list[dict[str, Any]] = []
-    cursor: str | None = None
+def _fetch_actuals(token: str, min_date: str, max_date: str):
+    url = f"{RUNN_API}/actuals"
+    cursor = None
     session = requests.Session()
-    timeout = int(os.environ.get("HTTP_TIMEOUT", "30"))
-
+    out = []
     while True:
-        params: dict[str, Any] = {"minDate": min_date, "maxDate": max_date, "limit": 200}
+        params = {
+            "minDate": min_date,
+            "maxDate": max_date,
+            "limit": 200,
+        }
         if cursor:
             params["cursor"] = cursor
-
-        response = session.get(url, headers=headers, params=params, timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-
-        items = payload.get("items") if isinstance(payload, dict) else payload
-        if not items:
-            break
-
-        for actual in items:
-            rows.append(
-                {
-                    "id": actual.get("id"),
-                    "date": actual.get("date"),
-                    "hours": actual.get("hours"),
-                    "projectId": actual.get("projectId"),
-                    "personId": actual.get("personId"),
-                    "roleId": actual.get("roleId"),
-                    "phaseId": actual.get("phaseId"),
-                    "note": actual.get("note"),
-                    "createdAt": actual.get("createdAt"),
-                    "updatedAt": actual.get("updatedAt"),
-                }
-            )
-
-        cursor = payload.get("nextCursor") if isinstance(payload, dict) else None
+        r = session.get(url, headers=_headers(token), params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        vals = data.get("values", [])
+        out.extend(vals)
+        cursor = data.get("nextCursor")
         if not cursor:
             break
+    return out
 
-    if not rows:
-        return {"ok": True, "result": "sin actuals en rango", "window_days": window_days}
+def _ensure_table():
+    client = bigquery.Client(project=BQ_PROJECT, location=BQ_LOCATION)
+    schema = [
+        bigquery.SchemaField("id", "STRING"),
+        bigquery.SchemaField("date", "DATE"),
+        bigquery.SchemaField("hours", "FLOAT"),
+        bigquery.SchemaField("personId", "STRING"),
+        bigquery.SchemaField("projectId", "STRING"),
+        bigquery.SchemaField("roleId", "STRING"),
+        bigquery.SchemaField("createdAt", "TIMESTAMP"),
+        bigquery.SchemaField("updatedAt", "TIMESTAMP"),
+        # agrega campos según lo que devuelva tu cuenta (safe-by-default)
+        bigquery.SchemaField("raw", "JSON"),
+    ]
+    table = bigquery.Table(TABLE_ID, schema=schema)
+    table = client.create_table(table, exists_ok=True)
 
-    bq = bigquery.Client(project=os.environ["BQ_PROJECT"])
-    dataset = os.environ.get("BQ_DATASET", "people_analytics")
-    table_id = f"{bq.project}.{dataset}.runn_actuals"
+def _rows(values):
+    rows = []
+    for v in values:
+        rows.append({
+            "id": str(v.get("id")),
+            "date": v.get("date"),
+            "hours": v.get("hours"),
+            "personId": str(v.get("personId")) if v.get("personId") is not None else None,
+            "projectId": str(v.get("projectId")) if v.get("projectId") is not None else None,
+            "roleId": str(v.get("roleId")) if v.get("roleId") is not None else None,
+            "createdAt": v.get("createdAt"),
+            "updatedAt": v.get("updatedAt"),
+            "raw": v,
+        })
+    return rows
 
-    dataset_id = f"{bq.project}.{dataset}"
+def export_handler(window_days: int = 90, **_):
+    token = os.environ.get("RUNN_API_TOKEN")
+    if not token:
+        return {"ok": False, "reason": "Falta RUNN_API_TOKEN"}
+    min_date, max_date = _daterange(window_days)
     try:
-        bq.get_dataset(dataset_id)
-    except Exception:
-        bq.create_dataset(bigquery.Dataset(dataset_id), exists_ok=True)
+        values = _fetch_actuals(token, min_date, max_date)
+    except requests.HTTPError as e:
+        return {"ok": False, "reason": f"HTTP {e.response.status_code}: {e.response.text}"}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
 
-    job = bq.load_table_from_json(
-        rows,
-        table_id,
-        job_config=bigquery.LoadJobConfig(
-            write_disposition="WRITE_TRUNCATE",
-            autodetect=True,
-        ),
-    )
-    job.result()
-
-    return {"ok": True, "rows": len(rows), "table": table_id, "window_days": window_days}
+    _ensure_table()
+    client = bigquery.Client(project=BQ_PROJECT, location=BQ_LOCATION)
+    errors = client.insert_rows_json(TABLE_ID, _rows(values))
+    if errors:
+        return {"ok": False, "reason": "Errores al insertar en BQ", "details": errors}
+    return {"ok": True, "count": len(values), "minDate": min_date, "maxDate": max_date}
