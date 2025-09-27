@@ -1,17 +1,15 @@
 # app/handlers/runn_full_sync.py
 """
-Handler HTTP y CLI para disparar la exportación completa de Runn -> BigQuery.
-- HTTP:  usado por /tasks/export-runn (Cloud Run/Flask).
-- CLI:   python -m app.handlers.runn_full_sync  (usa env vars).
+HTTP y CLI para exportar Runn -> BigQuery.
+- HTTP: usado por /tasks/export-runn
+- CLI:  python -m app.handlers.runn_full_sync
 """
-
 from __future__ import annotations
-import os
-import logging
+import os, logging
 from typing import List, Optional, Dict, Any
-from flask.typing import ResponseReturnValue  # no rompe en CLI, sólo tipado
+from flask.typing import ResponseReturnValue
 
-# Importa el exportador real (ya escribe en BigQuery)
+# Importa el export real
 from app.services.runn_export_all import run_full_sync as _run_full_sync
 
 log = logging.getLogger("runn-full-sync")
@@ -24,7 +22,6 @@ def _parse_targets_from_env() -> Optional[List[str]]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 def _parse_window_days(default_days: int = 120, *, request=None) -> int:
-    # Prioridad: query param (?window_days=) -> env WINDOW_DAYS -> default
     val = os.getenv("WINDOW_DAYS", str(default_days))
     try:
         days = int(val)
@@ -39,14 +36,21 @@ def _parse_window_days(default_days: int = 120, *, request=None) -> int:
             pass
     return days
 
-# ===== HTTP (Cloud Run/Flask) =====
-def export_handler(request=None) -> ResponseReturnValue:
+def _invoke_export(days: int, targets: Optional[List[str]]) -> Dict[str, Any]:
     """
-    Compatible con RUNN_EXPORT_HANDLER.
-    Acepta ?window_days=120 y ?targets=people,projects,actuals,...
+    Soporta ambas firmas de run_full_sync:
+      - run_full_sync(days: int)
+      - run_full_sync(window_days: Optional[int]=..., targets: Optional[List[str]]=...)
     """
-    days = _parse_window_days(default_days=120, request=request)
+    try:
+        # Preferir kwargs si existen
+        return _run_full_sync(window_days=days, targets=targets)  # type: ignore[call-arg]
+    except TypeError:
+        # Firma anterior (posicional)
+        return _run_full_sync(days)  # type: ignore[misc]
 
+def export_handler(request=None) -> ResponseReturnValue:
+    days = _parse_window_days(default_days=120, request=request)
     targets = None
     if request is not None:
         raw = (request.args.get("targets") or "").strip()
@@ -55,16 +59,13 @@ def export_handler(request=None) -> ResponseReturnValue:
     if targets is None:
         targets = _parse_targets_from_env()
 
-    log.info("Disparando export HTTP window_days=%s targets=%s", days, targets)
-    result: Dict[str, Any] = _run_full_sync(window_days=days, targets=targets)
+    log.info("Export window_days=%s targets=%s", days, targets)
+    result: Dict[str, Any] = _invoke_export(days, targets)
     return (result, 200)
 
-# ===== CLI =====
 if __name__ == "__main__":
-    # Permite: RUNN_EXPORT_TARGETS="people,projects,actuals" WINDOW_DAYS=180 python -m app.handlers.runn_full_sync
     days = _parse_window_days(default_days=120, request=None)
     targets = _parse_targets_from_env()
-    log.info("Disparando export CLI window_days=%s targets=%s", days, targets)
-    out = _run_full_sync(window_days=days, targets=targets)
-    # imprime el resumen para que veas fetched/inserted/merged por recurso
+    log.info("CLI export window_days=%s targets=%s", days, targets)
+    out = _invoke_export(days, targets)
     print(out)
