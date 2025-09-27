@@ -1,29 +1,5 @@
-from flask import Flask, request
+from app import create_app
 
-from app.blueprints.charthop_webhook import bp_ch, ch_webhook as ch_handler
-from app.blueprints.teamtailor_webhook import bp_tt, tt_webhook as tt_handler
-from app.blueprints.cron import bp_cron
-from app.tasks.ca_export import bp_tasks
-from app.tasks import runn_export  # importa rutas /tasks/export-runn
-
-app = Flask(__name__)
-app.register_blueprint(bp_ch)
-app.register_blueprint(bp_tt)
-app.register_blueprint(bp_cron)
-app.register_blueprint(bp_tasks)
-
-@app.route("/health", methods=["GET"])
-def health():
-    return "OK", 200
-
-@app.route("/", methods=["GET", "POST"])
-def root():
-    print(f"{request.method} {request.path} len={request.content_length}")
-    if request.method == "GET":
-        return "OK", 200
-    if request.headers.get("Teamtailor-Signature"):
-        return tt_handler()
-    payload = request.get_json(force=True, silent=True) or {}
-    if "resource_id" in payload:
-        return tt_handler()
-    return ch_handler()
+# Usa la factory; las rutas de /tasks/export-runn se montan en app/__init__.py
+# (asegúrate de que import_module("app.tasks.runn_export") ocurra ANTES de registrar bp_tasks)
+app = create_app()

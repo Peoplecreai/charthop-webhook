@@ -3,8 +3,8 @@ from flask import request, jsonify
 import logging
 import os
 
+# Permite inyectar el handler vía env; por defecto usa run_full_sync
 try:
-    # Permite inyectar el handler por env si quieres, pero default a runn_full_sync
     handler_path = os.getenv("RUNN_EXPORT_HANDLER", "app.handlers.runn_full_sync:run_full_sync")
     mod_name, func_name = handler_path.split(":")
     mod = __import__(mod_name, fromlist=[func_name])
@@ -14,7 +14,7 @@ except Exception as import_error:
     def export_handler(*args, **kwargs):
         return {"ok": False, "reason": "No se pudo importar RUNN_EXPORT_HANDLER", "details": str(import_error)}
 
-from app.tasks.ca_export import bp_tasks
+from app.tasks.ca_export import bp_tasks  # blueprint ya existente para /tasks
 
 @bp_tasks.post("/tasks/export-runn")
 def run_export_runn():
