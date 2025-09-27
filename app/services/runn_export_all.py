@@ -132,43 +132,57 @@ def _table_id(table: str) -> str:
 
 def _load_json(table: str, rows: List[Dict]):
     """
-    Carga lista de JSON a BQ con autodetección, guardando además una columna 'raw'.
-    WRITE_TRUNCATE para dejar idempotente por corrida.
+    Carga lista de JSON a BQ en formato NDJSON para evitar problemas con columnas object/JSON.
+    WRITE_TRUNCATE para idempotencia. Loguea el resultado del job.
     """
+    from io import BytesIO
+    import json
+
     client = _client()
     table_id = _table_id(table)
 
+    # Si no hay filas, asegura la tabla con un esquema mínimo
     if not rows:
-        # crea tabla vacía si no existe
         schema = [
-            bigquery.SchemaField("id", "STRING", mode="NULLABLE"),
-            bigquery.SchemaField("createdAt", "TIMESTAMP", mode="NULLABLE"),
-            bigquery.SchemaField("updatedAt", "TIMESTAMP", mode="NULLABLE"),
-            bigquery.SchemaField("raw", "JSON", mode="NULLABLE"),
+            bigquery.SchemaField("id", "STRING"),
+            bigquery.SchemaField("createdAt", "TIMESTAMP"),
+            bigquery.SchemaField("updatedAt", "TIMESTAMP"),
+            bigquery.SchemaField("raw", "JSON"),
         ]
-        tbl = bigquery.Table(table_id, schema=schema)
         try:
-            client.create_table(tbl)
-            log.info("Tabla vacía creada: %s", table_id)
+            client.get_table(table_id)
         except Exception:
-            pass
+            client.create_table(bigquery.Table(table_id, schema=schema))
+            log.info("Tabla creada vacía: %s", table_id)
         return
 
+    # Normaliza a DataFrame para forzar columnas básicas y luego arma NDJSON
     df = pd.json_normalize(rows, sep="_")
-    # columnas comunes si existen
     for col in ("id", "createdAt", "updatedAt"):
         if col not in df.columns:
             df[col] = None
-    df["raw"] = rows
+
+    # Convierte a NDJSON fila por fila
+    buf = BytesIO()
+    for i, r in df.iterrows():
+        obj = r.dropna().to_dict()
+        # Además guarda el JSON crudo por si quieres depurar o consultar campos no aplanados
+        obj["raw"] = rows[i]
+        line = json.dumps(obj, ensure_ascii=False)
+        buf.write((line + "\n").encode("utf-8"))
+    buf.seek(0)
 
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        source_format=bigquery.SourceFormat.PARQUET,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         autodetect=True,
     )
-    job = _client().load_table_from_dataframe(df, table_id, job_config=job_config)
-    job.result()
-    log.info("  %s filas -> %s", len(df), table_id)
+
+    job = client.load_table_from_file(buf, table_id, job_config=job_config)
+    result = job.result()  # espera y lanza si falla
+    dest = client.get_table(table_id)
+    log.info("CARGA %s -> %s filas_subidas=%s filas_en_tabla=%s estado=%s",
+             table, table_id, dest.num_rows, dest.num_rows, result.state)
 
 
 # ============ Exporters por recurso ============
