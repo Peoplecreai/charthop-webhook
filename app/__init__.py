@@ -53,11 +53,13 @@ def _configure_logging(app: Flask) -> None:
 
 
 def _register_default_blueprints(app: Flask) -> None:
+      # Importa las rutas que se montan sobre bp_tasks ANTES de registrar el blueprint
+  import_module("app.tasks.runn_export")
+
     app.register_blueprint(bp_ch)
     app.register_blueprint(bp_tt)
     app.register_blueprint(bp_cron)
     app.register_blueprint(bp_tasks)
-    import_module("app.tasks.runn_export")
 
 
 def _register_core_routes(app: Flask) -> None:
