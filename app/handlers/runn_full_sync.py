@@ -1,22 +1,20 @@
 # app/handlers/runn_full_sync.py
-# Handler HTTP o Job entrypoint compatible con RUNN_EXPORT_HANDLER
+# Handler/orquestador simple para ejecutar el Full Sync desde CLI o Gunicorn.
+
 import os
+import logging
+
 from app.services.runn_export_all import run_full_sync
 
-def export_handler(request=None):
-    # Permite override por query param ?days= o env WINDOW_DAYS
-    try:
-        days = int(os.getenv("WINDOW_DAYS", "180"))
-    except Exception:
-        days = 180
-    if request is not None:
-        try:
-            # Flask / Cloud Run request
-            arg_days = request.args.get("days")
-            if arg_days:
-                days = int(arg_days)
-        except Exception:
-            pass
-    run_full_sync(days)
-    # Si es HTTP, regresa 200
-    return ("ok", 200) if request is not None else None
+logging.basicConfig(level=logging.INFO)
+
+def export_handler(_event=None):
+    """
+    Entry point compatible con tu env var RUNN_EXPORT_HANDLER = app.handlers.runn_full_sync:export_handler
+    """
+    window = os.getenv("WINDOW_DAYS")
+    wd = int(window) if window else None
+    run_full_sync(window_days=wd)
+
+if __name__ == "__main__":
+    export_handler(None)
