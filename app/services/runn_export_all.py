@@ -6,7 +6,7 @@ import os
 import time
 import logging
 from datetime import date, timedelta
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import requests
 import pandas as pd
@@ -338,21 +338,67 @@ def export_project_rate_cards():
 
 # ============ Orquestación ============
 
-def run_full_sync(window_days: Optional[int] = None):
+def run_full_sync(
+    window_days: Optional[int] = None,
+    targets: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
     """
     Orquesta la exportación total. Llama a TODO lo relevante.
+
+    Args:
+        window_days: Ventana a utilizar para recursos filtrables. Si es ``None``
+            usa :data:`WINDOW_DAYS`.
+        targets: Lista opcional de secciones a ejecutar. Si se deja vacío o
+            contiene ``"all"`` se ejecutan todas.
+
+    Returns:
+        Un resumen con los targets ejecutados.
     """
+
     w = int(window_days if window_days is not None else WINDOW_DAYS)
-    log.info("=== RUNN FULL SYNC (window_days=%s) ===", w)
+    normalized: List[str] = []
+    if targets:
+        for t in targets:
+            if not t:
+                continue
+            key = t.strip().lower()
+            if key:
+                normalized.append(key)
 
-    export_dimensions()
-    export_assignments(w)
-    export_actuals(w)
-    export_time_offs(w)
-    export_project_subresources()
-    export_holidays_detail()
+    # Mantener orden lógico de exportación
+    steps: List[Tuple[str, Callable[[], None]]] = [
+        ("dimensions", export_dimensions),
+        ("assignments", lambda: export_assignments(w)),
+        ("actuals", lambda: export_actuals(w)),
+        ("time_offs", lambda: export_time_offs(w)),
+        ("project_subresources", export_project_subresources),
+        ("holidays", export_holidays_detail),
+        ("new_resources", export_new_resources),
+        ("project_rate_cards", export_project_rate_cards),
+    ]
 
-    export_new_resources()
-    export_project_rate_cards()
+    # Convertir a mapa de funciones llamables
+    ordered_targets = [name for name, _ in steps]
+    valid_names = set(ordered_targets)
+    requested_all = not normalized or any(t in ("all", "*") for t in normalized)
+    requested_set = valid_names if requested_all else {t for t in normalized if t in valid_names}
+    unknown = [t for t in normalized if t not in valid_names and t not in ("all", "*")]
 
-    log.info("=== RUNN FULL SYNC DONE ===")
+    executed: List[str] = []
+
+    log.info("=== RUNN FULL SYNC (window_days=%s targets=%s) ===", w, normalized or "all")
+
+    for name, fn in steps:
+        if requested_all or name in requested_set:
+            log.info("-> Export %s", name)
+            fn()
+            executed.append(name)
+        else:
+            log.info("-> Skip %s", name)
+
+    if unknown:
+        log.warning("Targets no reconocidos: %s", unknown)
+
+    log.info("=== RUNN FULL SYNC DONE (executed=%s) ===", executed)
+    skipped = [name for name in ordered_targets if name not in executed]
+    return {"window_days": w, "executed": executed, "skipped": skipped, "unknown": unknown}

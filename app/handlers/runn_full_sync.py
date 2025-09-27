@@ -21,7 +21,7 @@ def _parse_targets_from_env() -> Optional[List[str]]:
         return None
     return [t.strip() for t in raw.split(",") if t.strip()]
 
-def _parse_window_days(default_days: int = 120, *, request=None) -> int:
+def _parse_window_days(default_days: int = 180, *, request=None) -> int:
     val = os.getenv("WINDOW_DAYS", str(default_days))
     try:
         days = int(val)
@@ -36,7 +36,7 @@ def _parse_window_days(default_days: int = 120, *, request=None) -> int:
             pass
     return days
 
-def _invoke_export(days: int, targets: Optional[List[str]]) -> Dict[str, Any]:
+def _invoke_export(days: int, targets: Optional[List[str]]) -> Optional[Dict[str, Any]]:
     """
     Soporta ambas firmas de run_full_sync:
       - run_full_sync(days: int)
@@ -45,12 +45,14 @@ def _invoke_export(days: int, targets: Optional[List[str]]) -> Dict[str, Any]:
     try:
         # Preferir kwargs si existen
         return _run_full_sync(window_days=days, targets=targets)  # type: ignore[call-arg]
-    except TypeError:
+    except TypeError as exc:
         # Firma anterior (posicional)
+        if "unexpected keyword" not in str(exc):
+            raise
         return _run_full_sync(days)  # type: ignore[misc]
 
 def export_handler(request=None) -> ResponseReturnValue:
-    days = _parse_window_days(default_days=120, request=request)
+    days = _parse_window_days(default_days=180, request=request)
     targets = None
     if request is not None:
         raw = (request.args.get("targets") or "").strip()
@@ -60,11 +62,12 @@ def export_handler(request=None) -> ResponseReturnValue:
         targets = _parse_targets_from_env()
 
     log.info("Export window_days=%s targets=%s", days, targets)
-    result: Dict[str, Any] = _invoke_export(days, targets)
-    return (result, 200)
+    result = _invoke_export(days, targets)
+    body: Dict[str, Any] = {"status": "ok", **(result or {})}
+    return (body, 200)
 
 if __name__ == "__main__":
-    days = _parse_window_days(default_days=120, request=None)
+    days = _parse_window_days(default_days=180, request=None)
     targets = _parse_targets_from_env()
     log.info("CLI export window_days=%s targets=%s", days, targets)
     out = _invoke_export(days, targets)
