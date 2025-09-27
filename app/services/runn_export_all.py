@@ -49,22 +49,46 @@ def _url(path: str) -> str:
         path = "/" + path
     return f"{RUNN_API_BASE}{path}"
 
-def _should_retry(exc: Exception) -> bool:
+class HTTPStatusError(RunnError):
+    def __init__(self, status: int, msg: str, retry_after: Optional[int] = None):
+        super().__init__(f"HTTP {status}: {msg}")
+        self.status = status
+        self.retry_after = retry_after
+
+def _is_transient(exc: Exception) -> bool:
     if isinstance(exc, requests.RequestException):
         return True
+    if isinstance(exc, HTTPStatusError):
+        # Retriables típicos
+        return exc.status in (408, 429, 500, 502, 503, 504)
     return False
 
 @retry(
     wait=wait_exponential(multiplier=1, min=1, max=30),
     stop=stop_after_attempt(5),
-    retry=retry_if_exception(_should_retry),
+    retry=retry_if_exception(_is_transient),
     before_sleep=before_sleep_log(log, logging.WARNING),
 )
 def _get(path: str, params: Optional[Dict[str, str]] = None) -> Dict:
     r = requests.get(_url(path), headers=_headers(), params=params, timeout=HTTP_TIMEOUT)
-    if r.status_code >= 400:
-        raise RunnError(f"GET {path} -> {r.status_code}: {r.text[:500]}")
-    return r.json() if r.text else {}
+
+    # Éxito
+    if 200 <= r.status_code < 300:
+        return r.json() if r.text else {}
+
+    # Errores transitorios (reintentar)
+    if r.status_code in (408, 429, 500, 502, 503, 504):
+        # Respeta Retry-After si está presente (segundos)
+        ra = r.headers.get("Retry-After")
+        if ra:
+            try:
+                time.sleep(int(ra))
+            except Exception:
+                pass
+        raise HTTPStatusError(r.status_code, r.text[:500])
+
+    # Errores no transitorios (4xx que no son 408/429)
+    raise RunnError(f"GET {path} -> {r.status_code}: {r.text[:500]}")
 
 def fetch_all(path: str, params: Optional[Dict[str, str]] = None) -> List[Dict]:
     """
