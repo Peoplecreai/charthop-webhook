@@ -1,4 +1,4 @@
-# handlers/runn_full_sync.py
+# app/handlers/runn_full_sync.py
 from __future__ import annotations
 
 import os
@@ -44,11 +44,6 @@ SESSION.headers.update(
 
 # =========================
 # Catálogo de recursos Runn
-# path: relativo al API
-# pk:   primary key
-# ts:   campo timestamp para incremental (si aplica); si no, ponemos uno razonable
-# supports_modified: si acepta ?modifiedAfter
-# partition_field:   partición en destino BQ si hace sentido
 # =========================
 CONFIG: Dict[str, Dict[str, Any]] = {
     # Hechos
@@ -59,7 +54,6 @@ CONFIG: Dict[str, Dict[str, Any]] = {
         "supports_modified": True,
         "partition_field": "date",
     },
-    # Algunos tenants tienen "time entries" en endpoints distintos; mantenemos ambos
     "time-entries": {
         "path": "time-entries/",
         "pk": "id",
@@ -121,7 +115,7 @@ CONFIG: Dict[str, Dict[str, Any]] = {
     "roles": {
         "path": "roles/",
         "pk": "id",
-        "ts": "updatedAt",
+        "ts": "updatedAt",  # hay tenants sin updatedAt → el MERGE lo detecta y hace upsert plano
         "supports_modified": False,
         "partition_field": None,
     },
@@ -139,7 +133,7 @@ CONFIG: Dict[str, Dict[str, Any]] = {
         "supports_modified": True,
         "partition_field": None,
     },
-    # Rate cards
+    # Rate cards y project rates
     "rate-cards": {
         "path": "rate-cards/",
         "pk": "id",
@@ -147,7 +141,6 @@ CONFIG: Dict[str, Dict[str, Any]] = {
         "supports_modified": True,
         "partition_field": None,
     },
-    # En algunos tenants hay “project-rates”
     "project-rates": {
         "path": "project-rates/",
         "pk": "id",
@@ -176,7 +169,7 @@ def _sleep_backoff(attempt: int, retry_after: Optional[str | int]) -> None:
             return
         except Exception:
             pass
-    # Exponencial simple: 0.5,1,2,4,8,16 (máx 30s)
+    # Exponencial simple: 0.5,1,2,4,8,16 (máximo 30s)
     wait = min(0.5 * (2 ** attempt), 30.0)
     time.sleep(wait)
 
@@ -210,8 +203,6 @@ def _paged_collect(resource: str, window_days: int) -> List[Dict[str, Any]]:
         params.update({"minDate": min_date, "maxDate": max_date})
 
     if resource.startswith("time-offs/"):
-        # En time-offs aplicamos ventana amplia por seguridad
-        # leave: startDate/endDate; holidays/rostered: date
         params.update({"minDate": min_date, "maxDate": max_date})
 
     # Incremental por updatedAt si lo soporta el endpoint
@@ -262,7 +253,7 @@ def _ensure_table_from_staging_if_missing(
     copy_job = client.copy_table(staging_fqn, target_fqn, location=BQ_LOCATION)
     copy_job.result()
 
-    # Añadir partición si aplica (solo cuando es tabla nueva; si ya existe, respetamos)
+    # Añadir partición si aplica (solo cuando es tabla nueva)
     if partition_field:
         tbl = client.get_table(target_fqn)
         if not tbl.time_partitioning:
@@ -297,7 +288,7 @@ def _merge_upsert(
     )
     load_job.result()
 
-    # Asegurar target (si no existe, lo construyo copiando staging)
+    # Asegurar target (si no existe, lo creo copiando staging y agrego partición si aplica)
     _ensure_table_from_staging_if_missing(client, target, staging, cfg["partition_field"])
 
     # Resolver esquema para MERGE
@@ -317,25 +308,43 @@ def _merge_upsert(
         f"T.{col} = SAFE_CAST(S.{col} AS {schema_map[col].field_type})" for col in columns
     )
     insert_columns = ", ".join(columns)
-    insert_values = ", ".join(f"SAFE_CAST(S.{col} AS {schema_map[col].field_type})" for col in columns)
+    insert_values = ", ".join(
+        f"SAFE_CAST(S.{col} AS {schema_map[col].field_type})" for col in columns
+    )
 
-    # Si una tabla no tiene updatedAt (o ts no existe), igualamos siempre
-    # comparando con NULL-safe. SAFE.TIMESTAMP devuelve NULL si no castea.
-    merge_sql = f"""
-    MERGE `{target}` T
-    USING `{staging}` S
-    ON CAST(T.{pk} AS STRING) = CAST(S.{pk} AS STRING)
-    WHEN MATCHED AND (
-        (SAFE.TIMESTAMP(S.{ts}) > SAFE.TIMESTAMP(T.{ts}))
-        OR T.{ts} IS NULL
-        OR S.{ts} IS NULL
-    ) THEN
-      UPDATE SET
-        {assignments}
-    WHEN NOT MATCHED THEN
-      INSERT ({insert_columns})
-      VALUES ({insert_values})
-    """
+    # ¿Tenemos columna de timestamp en ambos lados (staging y target)?
+    has_ts = ts in staging_fields and ts in schema_map
+
+    if has_ts:
+        # MERGE con comparación por timestamp (solo actualiza si S.ts > T.ts)
+        merge_sql = f"""
+        MERGE `{target}` T
+        USING `{staging}` S
+        ON CAST(T.{pk} AS STRING) = CAST(S.{pk} AS STRING)
+        WHEN MATCHED AND (
+            (SAFE.TIMESTAMP(S.{ts}) > SAFE.TIMESTAMP(T.{ts}))
+            OR T.{ts} IS NULL
+            OR S.{ts} IS NULL
+        ) THEN
+          UPDATE SET
+            {assignments}
+        WHEN NOT MATCHED THEN
+          INSERT ({insert_columns})
+          VALUES ({insert_values})
+        """
+    else:
+        # MERGE sin timestamp: cualquier match se actualiza
+        merge_sql = f"""
+        MERGE `{target}` T
+        USING `{staging}` S
+        ON CAST(T.{pk} AS STRING) = CAST(S.{pk} AS STRING)
+        WHEN MATCHED THEN
+          UPDATE SET
+            {assignments}
+        WHEN NOT MATCHED THEN
+          INSERT ({insert_columns})
+          VALUES ({insert_values})
+        """
 
     job = client.query(merge_sql, location=BQ_LOCATION)
     job.result()
@@ -343,7 +352,11 @@ def _merge_upsert(
     # Limpio staging
     client.delete_table(staging, not_found_ok=True)
 
-    return {"inserted": job.num_dml_inserted_rows or 0, "merged": job.num_dml_updated_rows or 0, "table": target}
+    return {
+        "inserted": job.num_dml_inserted_rows or 0,
+        "merged": job.num_dml_updated_rows or 0,
+        "table": target,
+    }
 
 
 def run_full_sync(window_days: Optional[int] = None, targets: Optional[List[str]] = None) -> Dict[str, Any]:
