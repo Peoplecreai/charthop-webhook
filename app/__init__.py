@@ -2,18 +2,20 @@
 from importlib import import_module
 from flask import Flask
 
+# Blueprints principales
 from app.blueprints.charthop_webhook import bp_ch
 from app.blueprints.teamtailor_webhook import bp_tt
 from app.blueprints.cron import bp_cron
-from app.tasks.ca_export import bp_tasks  # blueprint de /tasks
+from app.tasks.ca_export import bp_tasks  # Blueprint de /tasks
 
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # 1) Importa rutas que agregan endpoints a bp_tasks
+    # Importa módulos que añaden rutas al blueprint de tareas
+    # Esto DEBE ocurrir antes de registrar bp_tasks en la app.
     import_module("app.tasks.runn_export")  # define /tasks/export-runn en bp_tasks
 
-    # 2) Registra blueprints en el app
+    # Registra blueprints
     app.register_blueprint(bp_ch)
     app.register_blueprint(bp_tt)
     app.register_blueprint(bp_cron)
