@@ -1,5 +1,6 @@
 # app/tasks/runn_export.py
-from flask import request, jsonify
+from flask import jsonify, request
+from flask.typing import ResponseReturnValue
 
 import logging
 
@@ -22,7 +23,7 @@ except ModuleNotFoundError as import_error:  # pragma: no cover - defensive guar
 from app.tasks.ca_export import bp_tasks
 
 @bp_tasks.post("/tasks/export-runn")
-def run_export_runn():
+def run_export_runn() -> ResponseReturnValue:
     window_days = int(request.args.get("window_days", "120"))
     result = export_runn_snapshot(window_days=window_days)
     return jsonify({"ok": True, "result": result}), 200
