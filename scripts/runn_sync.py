@@ -27,6 +27,10 @@ COLLS = {
     "runn_timeoffs_leave": "/time-offs/leave/",
     "runn_timeoffs_rostered": "/time-offs/rostered/",
     "runn_timeoffs_holidays": "/time-offs/holidays/",
+    "runn_contracts": "/contracts/",
+    "runn_custom_fields": "/custom-fields/",
+    "runn_holiday_groups": "/holiday-groups/",
+    "runn_placeholders": "/placeholders/",
 }
 
 def state_table() -> str:
