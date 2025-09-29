@@ -57,10 +57,13 @@ COLLS: Dict[str, str] = {
     "runn_timeoffs_rostered": "/time-offs/rostered/",
     "runn_timeoffs_holidays": "/time-offs/holidays/",
     # nuevos que pediste:
-    "runn_contracts": "/contracts/",
-    "runn_custom_fields": "/custom-fields/",
     "runn_holiday_groups": "/holiday-groups/",
-    "runn_placeholders": "/placeholders/",
+    "runn_placeholders": ("/placeholders/", {}),                 # admite modifiedAfter
+    "runn_contracts":    ("/contracts/",   {"sortBy": "id"}),    # admite modifiedAfter; sortBy seguro
+
+    # Custom fields por tipo + model
+    "runn_custom_fields_checkbox_person":  ("/custom-fields/checkbox/", {"model": "PERSON"}),
+    "runn_custom_fields_checkbox_project": ("/custom-fields/checkbox/", {"model": "PROJECT"}),
 }
 
 
