@@ -1,46 +1,28 @@
 from __future__ import annotations
-
-import os
-import sys
-import time
-import json
-import argparse
-import datetime as dt
-from typing import Dict, List, Optional
-
-import requests
+import os, argparse, datetime as dt, time, json, requests
+from typing import Dict, List, Tuple, Optional, Union
 from google.cloud import bigquery
 
-
-# -----------------------------
-# Configuración de API y BQ
-# -----------------------------
+# -----------------------
+# Config HTTP / Entorno
+# -----------------------
 API = "https://api.runn.io"
-
-# Variables de entorno requeridas:
-# - RUNN_API_TOKEN (Secret)
-# - BQ_PROJECT
-# - BQ_DATASET
-try:
-    PROJ = os.environ["BQ_PROJECT"]
-    DS = os.environ["BQ_DATASET"]
-    RUNN_TOKEN = os.environ["RUNN_API_TOKEN"]
-except KeyError as e:
-    missing = e.args[0]
-    print(f"Falta variable de entorno requerida: {missing}", file=sys.stderr)
-    sys.exit(2)
-
 HDRS = {
-    "Authorization": f"Bearer {RUNN_TOKEN}",
+    "Authorization": f"Bearer {os.environ['RUNN_API_TOKEN']}",
     "Accept-Version": "1.0.0",
     "Accept": "application/json",
 }
+PROJ = os.environ["BQ_PROJECT"]
+DS   = os.environ["BQ_DATASET"]
 
-
-# -----------------------------
-# Endpoints a sincronizar
-# -----------------------------
-COLLS: Dict[str, str] = {
+# -----------------------------------------------------------------------------
+# Catálogo de colecciones.
+# Valor puede ser:
+#   - str  -> solo path
+#   - (path, {params}) -> path + parámetros fijos de query
+# -----------------------------------------------------------------------------
+COLLS: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = {
+    # Base (ya existentes en tu repo)
     "runn_people": "/people/",
     "runn_projects": "/projects/",
     "runn_clients": "/clients/",
@@ -56,35 +38,34 @@ COLLS: Dict[str, str] = {
     "runn_timeoffs_leave": "/time-offs/leave/",
     "runn_timeoffs_rostered": "/time-offs/rostered/",
     "runn_timeoffs_holidays": "/time-offs/holidays/",
-    # nuevos que pediste:
-    "runn_holiday_groups": "/holiday-groups/",
-    "runn_placeholders": ("/placeholders/", {}),                 # admite modifiedAfter
-    "runn_contracts":    ("/contracts/",   {"sortBy": "id"}),    # admite modifiedAfter; sortBy seguro
 
-    # Custom fields por tipo + model
+    # --- Nuevas que pediste ---
+    # Grupos de feriados
+    "runn_holiday_groups": "/holiday-groups/",
+    # Placeholders (admite modifiedAfter)
+    "runn_placeholders": ("/placeholders/", {}),
+    # Contracts (admite modifiedAfter; sortBy requerido/seguro)
+    "runn_contracts": ("/contracts/", {"sortBy": "id"}),
+
+    # Custom Fields por TIPO + model (según la doc v1.0)
+    # Ejemplo con checkbox; puedes añadir text/enum/number/date replicando el patrón.
     "runn_custom_fields_checkbox_person":  ("/custom-fields/checkbox/", {"model": "PERSON"}),
     "runn_custom_fields_checkbox_project": ("/custom-fields/checkbox/", {"model": "PROJECT"}),
 }
 
-
-# -----------------------------
-# Watermark de sincronización
-# -----------------------------
+# -----------------------
+# Estado de sync en BQ
+# -----------------------
 def state_table() -> str:
     return f"{PROJ}.{DS}.__runn_sync_state"
 
-
-def ensure_state_table(bq: bigquery.Client) -> None:
-    bq.query(
-        f"""
-        CREATE TABLE IF NOT EXISTS `{state_table()}`(
-          table_name STRING NOT NULL,
-          last_success TIMESTAMP,
-          PRIMARY KEY(table_name) NOT ENFORCED
-        )
-        """
-    ).result()
-
+def ensure_state_table(bq: bigquery.Client):
+    bq.query(f"""
+    CREATE TABLE IF NOT EXISTS `{state_table()}`(
+      table_name STRING NOT NULL,
+      last_success TIMESTAMP,
+      PRIMARY KEY(table_name) NOT ENFORCED
+    )""").result()
 
 def get_last_success(bq: bigquery.Client, name: str) -> Optional[dt.datetime]:
     q = bq.query(
@@ -97,40 +78,41 @@ def get_last_success(bq: bigquery.Client, name: str) -> Optional[dt.datetime]:
         return r[0]
     return None
 
-
-def set_last_success(bq: bigquery.Client, name: str, ts: dt.datetime) -> None:
+def set_last_success(bq: bigquery.Client, name: str, ts: dt.datetime):
     bq.query(
-        f"""
-        MERGE `{state_table()}` T
-        USING (SELECT @t AS table_name, @ts AS last_success) S
-        ON T.table_name=S.table_name
-        WHEN MATCHED THEN UPDATE SET last_success=S.last_success
-        WHEN NOT MATCHED THEN INSERT(table_name,last_success) VALUES(S.table_name,S.last_success)
-        """,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("t", "STRING", name),
-                bigquery.ScalarQueryParameter("ts", "TIMESTAMP", ts.isoformat()),
-            ]
-        ),
+      f"""
+      MERGE `{state_table()}` T
+      USING (SELECT @t AS table_name, @ts AS last_success) S
+      ON T.table_name=S.table_name
+      WHEN MATCHED THEN UPDATE SET last_success=S.last_success
+      WHEN NOT MATCHED THEN INSERT(table_name,last_success) VALUES(S.table_name,S.last_success)
+      """,
+      job_config=bigquery.QueryJobConfig(
+        query_parameters=[
+          bigquery.ScalarQueryParameter("t","STRING",name),
+          bigquery.ScalarQueryParameter("ts","TIMESTAMP",ts.isoformat())
+        ]
+      )
     ).result()
 
+# -----------------------
+# Descarga paginada
+# -----------------------
+def _supports_modified_after(path: str) -> bool:
+    tail = path.rstrip("/").split("/")[-1]
+    # según docs: actuals, assignments, contracts, placeholders aceptan modifiedAfter
+    return tail in {"actuals", "assignments", "contracts", "placeholders"}
 
-# -----------------------------
-# Extracción desde Runn (paginada)
-# -----------------------------
-def fetch_all(path: str, since_iso: Optional[str], limit: int = 200) -> List[dict]:
-    s = requests.Session()
-    s.headers.update(HDRS)
-    out: List[dict] = []
+def fetch_all(path: str, since_iso: Optional[str], limit=200, extra_params: Optional[Dict[str,str]]=None) -> List[Dict]:
+    s = requests.Session(); s.headers.update(HDRS)
+    out: List[Dict] = []
     cursor: Optional[str] = None
 
-    endpoint_key = path.rstrip("/").split("/")[-1]  # p.ej. "actuals"
-
     while True:
-        params = {"limit": limit}
-        # Sólo endpoints grandes soportados para delta por "modifiedAfter"
-        if since_iso and endpoint_key in {"actuals", "assignments"}:
+        params: Dict[str, str] = {"limit": str(limit)}
+        if extra_params:
+            params.update(extra_params)
+        if since_iso and _supports_modified_after(path):
             params["modifiedAfter"] = since_iso
         if cursor:
             params["cursor"] = cursor
@@ -139,6 +121,11 @@ def fetch_all(path: str, since_iso: Optional[str], limit: int = 200) -> List[dic
         if r.status_code == 429:
             time.sleep(int(r.headers.get("Retry-After", "5") or "5"))
             continue
+        if r.status_code == 404:
+            # endpoint no disponible en el tenant/plan; no rompemos el job
+            if os.environ.get("RUNN_DEBUG"):
+                print(f"[WARN] 404 Not Found: {API+path} params={params}  (ignorado)")
+            return []
         r.raise_for_status()
 
         payload = r.json()
@@ -151,54 +138,47 @@ def fetch_all(path: str, since_iso: Optional[str], limit: int = 200) -> List[dic
         if not cursor:
             break
 
+    if os.environ.get("RUNN_DEBUG"):
+        print(f"[INFO] fetched {len(out)} rows from {path} (params={extra_params or {}})")
     return out
 
-
-# -----------------------------
-# Carga y MERGE en BigQuery
-# -----------------------------
-def load_merge(table_base: str, rows: List[dict], bq: bigquery.Client) -> int:
-    """
-    Sube a _stg__* con autodetección.
-    Si hay columna 'id', hace MERGE T<->S con CAST a STRING en ON e INSERT.
-    Si no hay 'id', reemplaza la tabla final.
-    Devuelve filas en tabla final.
-    """
+# -----------------------
+# Carga y MERGE a BQ
+# -----------------------
+def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     if not rows:
         return 0
 
     stg = f"{PROJ}.{DS}._stg__{table_base}"
     tgt = f"{PROJ}.{DS}.{table_base}"
 
-    # 1) Carga a staging
+    # 1) Carga staging con autodetección
     job = bq.load_table_from_json(
         rows,
         stg,
         job_config=bigquery.LoadJobConfig(
             write_disposition="WRITE_TRUNCATE",
-            autodetect=True,
-        ),
+            autodetect=True
+        )
     )
     job.result()
 
     stg_tbl = bq.get_table(stg)
     stg_schema = stg_tbl.schema
 
-    # 2) Asegura existencia de target con el mismo esquema inicial
+    # 2) Asegura target
     try:
         bq.get_table(tgt)
     except Exception:
         bq.create_table(bigquery.Table(tgt, schema=stg_schema))
 
-    # 3) MERGE seguro por id (CAST ambos lados a STRING)
+    # 3) MERGE por id (cast a STRING para evitar choques INT64/STRING)
     has_id = any(c.name == "id" for c in stg_schema)
     if has_id:
         cols = [c.name for c in stg_schema]
         non_id_cols = [c for c in cols if c != "id"]
 
-        # SET columna a columna (sin tocar id)
-        set_clause = ", ".join([f"T.{c}=S.{c}" for c in non_id_cols]) or "id = id"
-
+        set_clause  = ", ".join([f"T.{c}=S.{c}" for c in non_id_cols])
         insert_cols = ", ".join(["id"] + non_id_cols)
         insert_vals = ", ".join(["CAST(S.id AS STRING)"] + [f"S.{c}" for c in non_id_cols])
 
@@ -212,102 +192,69 @@ def load_merge(table_base: str, rows: List[dict], bq: bigquery.Client) -> int:
           INSERT ({insert_cols}) VALUES ({insert_vals})
         """
     else:
-        # Si no hay 'id', reemplazo completo
         sql = f"CREATE OR REPLACE TABLE `{tgt}` AS SELECT * FROM `{stg}`"
 
     bq.query(sql).result()
-    return int(bq.get_table(tgt).num_rows)
+    return bq.get_table(tgt).num_rows
 
-
-# -----------------------------
+# -----------------------
 # CLI
-# -----------------------------
-def parse_args() -> argparse.Namespace:
+# -----------------------
+def parse_only(raw: Optional[List[str]]) -> Optional[List[str]]:
+    """Acepta --only repetido o lista separada por comas."""
+    if not raw:
+        return None
+    out: List[str] = []
+    for item in raw:
+        out.extend([p.strip() for p in item.split(",") if p.strip()])
+    # dedup manteniendo orden
+    seen = set(); ordered = []
+    for k in out:
+        if k not in seen:
+            seen.add(k); ordered.append(k)
+    return ordered
+
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["full", "delta"], default="delta")
+    ap.add_argument("--mode", choices=["full","delta"], default="delta")
     ap.add_argument("--delta-days", type=int, default=90)
-    # --only repetible o lista separada por comas; compatible hacia atrás
-    ap.add_argument("--only", action="append", help="Repite el flag o pasa lista separada por comas.")
-    # opcional: falla si todo devuelve 0 filas (útil en jobs programados)
-    ap.add_argument("--fail-on-zero", action="store_true", help="Falla si ninguna colección cargó filas.")
-    return ap.parse_args()
+    ap.add_argument("--only", action="append", help="repetible o coma-separado: runn_people,runn_projects,…")
+    args = ap.parse_args()
 
-
-def build_targets(args_only: Optional[List[str]]) -> Dict[str, str]:
-    if not args_only:
-        return COLLS
-    wanted: List[str] = []
-    for item in args_only:
-        wanted += [x.strip() for x in item.split(",") if x.strip()]
-    # Validación explícita para evitar no-ops silenciosos
-    missing = [k for k in wanted if k not in COLLS]
-    if missing:
-        raise SystemExit(f"--only contiene claves desconocidas: {missing}")
-    return {k: COLLS[k] for k in wanted}
-
-
-def main() -> None:
-    args = parse_args()
-
-    if os.getenv("RUNN_DEBUG") == "1":
-        print("argv:", sys.argv)
-        print("mode:", args.mode)
-        print("delta-days:", args.delta_days)
-        print("only_raw:", args.only)
+    only_list = parse_only(args.only)
 
     bq = bigquery.Client(project=PROJ)
     ensure_state_table(bq)
 
     now = dt.datetime.now(dt.timezone.utc)
-    targets = build_targets(args.only)
 
-    if os.getenv("RUNN_DEBUG") == "1":
-        print("targets:", sorted(list(targets.keys())))
+    targets: Dict[str, Union[str, Tuple[str, Dict[str,str]]]]
+    if not only_list:
+        targets = COLLS
+    else:
+        targets = {k: COLLS[k] for k in only_list if k in COLLS}
 
     summary: Dict[str, int] = {}
-    any_rows = False
+    for tbl, spec in targets.items():
+        if isinstance(spec, tuple):
+            path, extra = spec
+        else:
+            path, extra = spec, None
 
-    for tbl, path in targets.items():
-        # Calcular ventana delta si aplica
         since_iso: Optional[str] = None
         if args.mode == "delta":
             last = get_last_success(bq, tbl)
             if last:
                 since_iso = last.strftime("%Y-%m-%dT%H:%M:%SZ")
-            elif tbl in {"runn_actuals", "runn_assignments"}:
+            elif path.rstrip("/").split("/")[-1] in {"actuals","assignments","contracts","placeholders"}:
                 since_iso = (now - dt.timedelta(days=args.delta_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        if os.getenv("RUNN_DEBUG") == "1":
-            print(f"Fetching {tbl} from {path} (since={since_iso or 'FULL'})")
-
-        rows = fetch_all(path, since_iso)
-        loaded = load_merge(tbl, rows, bq)
-        summary[tbl] = int(loaded)
-        if loaded > 0:
-            any_rows = True
-
-        # Avanza watermark (timestamp de esta corrida)
+        rows = fetch_all(path, since_iso, extra_params=extra)
+        n = load_merge(tbl, rows, bq)
+        summary[tbl] = int(n)
         set_last_success(bq, tbl, now)
 
     print(json.dumps({"ok": True, "loaded": summary}, ensure_ascii=False))
 
-    if args.fail_on_zero and not any_rows:
-        # nada cargado: exit code 3 para que Scheduler/Alerting lo capte
-        sys.exit(3)
-
-
 if __name__ == "__main__":
-    try:
-        main()
-    except requests.HTTPError as e:
-        # Errores HTTP de la API de Runn
-        try:
-            payload = e.response.json()
-        except Exception:
-            payload = e.response.text
-        print(json.dumps({"ok": False, "error": "runn_api", "status": e.response.status_code, "detail": payload}), file=sys.stderr)
-        sys.exit(2)
-    except Exception as e:
-        # Cualquier otra excepción
-        print(json.dumps({"ok": False, "error": "unexpected", "detail": str(e)}), file=sys.stderr)
-        sys.exit(2)
+    main()
