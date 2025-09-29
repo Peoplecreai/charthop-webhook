@@ -22,15 +22,15 @@ COLLS = {
     "runn_project_tags": "/project-tags/",
     "runn_rate_cards": "/rate-cards/",
     "runn_workstreams": "/workstreams/",
-    "runn_contracts": "/contracts/",
-    "runn_custom_fields": "/custom-fields/",
-    "runn_holiday_groups": "/holiday-groups/",
-    "runn_placeholders": "/placeholders/",
     "runn_assignments": "/assignments/",
     "runn_actuals": "/actuals/",
     "runn_timeoffs_leave": "/time-offs/leave/",
     "runn_timeoffs_rostered": "/time-offs/rostered/",
     "runn_timeoffs_holidays": "/time-offs/holidays/",
+    "runn_contracts": "/contracts/",
+    "runn_custom_fields": "/custom-fields/",
+    "runn_holiday_groups": "/holiday-groups/",
+    "runn_placeholders": "/placeholders/",
 }
 
 def state_table() -> str:
