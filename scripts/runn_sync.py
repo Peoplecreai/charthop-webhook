@@ -15,6 +15,9 @@ HDRS = {
 PROJ = os.environ["BQ_PROJECT"]
 DS   = os.environ["BQ_DATASET"]
 
+# Filtro opcional para holidays (si lo defines en el Job limitará el volumen)
+RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")  # p.ej. "17291"
+
 # -----------------------------------------------------------------------------
 # Catálogo de colecciones.
 # Valor puede ser:
@@ -22,7 +25,7 @@ DS   = os.environ["BQ_DATASET"]
 #   - (path, {params}) -> path + parámetros fijos de query
 # -----------------------------------------------------------------------------
 COLLS: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = {
-    # Base (ya existentes en tu repo)
+    # Base (ya existentes)
     "runn_people": "/people/",
     "runn_projects": "/projects/",
     "runn_clients": "/clients/",
@@ -37,18 +40,15 @@ COLLS: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = {
     "runn_actuals": "/actuals/",
     "runn_timeoffs_leave": "/time-offs/leave/",
     "runn_timeoffs_rostered": "/time-offs/rostered/",
+    # holidays con params opcionales (se agregan abajo en tiempo de ejecución)
     "runn_timeoffs_holidays": "/time-offs/holidays/",
 
-    # --- Nuevas que pediste ---
-    # Grupos de feriados
+    # Nuevas que pediste
     "runn_holiday_groups": "/holiday-groups/",
-    # Placeholders (admite modifiedAfter)
     "runn_placeholders": ("/placeholders/", {}),
-    # Contracts (admite modifiedAfter; sortBy requerido/seguro)
     "runn_contracts": ("/contracts/", {"sortBy": "id"}),
 
-    # Custom Fields por TIPO + model (según la doc v1.0)
-    # Ejemplo con checkbox; puedes añadir text/enum/number/date replicando el patrón.
+    # Custom Fields (ejemplos)
     "runn_custom_fields_checkbox_person":  ("/custom-fields/checkbox/", {"model": "PERSON"}),
     "runn_custom_fields_checkbox_project": ("/custom-fields/checkbox/", {"model": "PROJECT"}),
 }
@@ -145,8 +145,37 @@ def fetch_all(path: str, since_iso: Optional[str], limit=200, extra_params: Opti
 # -----------------------
 # Carga y MERGE a BQ
 # -----------------------
+def _create_empty_timeoff_table_if_needed(table_base: str, bq: bigquery.Client) -> None:
+    """
+    Crea una tabla vacía con esquema mínimo para timeoffs (leave/rostered),
+    solo si no existe. Útil cuando el API devuelve 0 y no queremos romper vistas.
+    """
+    if table_base not in {"runn_timeoffs_leave", "runn_timeoffs_rostered"}:
+        return
+    tgt = f"{PROJ}.{DS}.{table_base}"
+    try:
+        bq.get_table(tgt)
+        return
+    except Exception:
+        pass
+
+    # esquema mínimo razonable (coincide con campos típicos del API)
+    schema = [
+        bigquery.SchemaField("id", "STRING"),
+        bigquery.SchemaField("personId", "STRING"),
+        bigquery.SchemaField("startDate", "DATE"),
+        bigquery.SchemaField("endDate", "DATE"),
+        bigquery.SchemaField("note", "STRING"),
+        bigquery.SchemaField("createdAt", "TIMESTAMP"),
+        bigquery.SchemaField("updatedAt", "TIMESTAMP"),
+        bigquery.SchemaField("minutesPerDay", "INT64"),
+    ]
+    bq.create_table(bigquery.Table(tgt, schema=schema))
+
 def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     if not rows:
+        # crea tabla vacía para leave/rostered si no existe
+        _create_empty_timeoff_table_if_needed(table_base, bq)
         return 0
 
     stg = f"{PROJ}.{DS}._stg__{table_base}"
@@ -228,11 +257,20 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
 
+    # Inyecta param de filtro para holidays si viene RUNN_HOLIDAY_GROUP_ID
+    collections: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = dict(COLLS)
+    if RUNN_HOLIDAY_GROUP_ID:
+        # sobrescribe holidays con params (no rompe si ya existía simple)
+        collections["runn_timeoffs_holidays"] = (
+            "/time-offs/holidays/",
+            {"holidayGroupId": RUNN_HOLIDAY_GROUP_ID}
+        )
+
     targets: Dict[str, Union[str, Tuple[str, Dict[str,str]]]]
     if not only_list:
-        targets = COLLS
+        targets = collections
     else:
-        targets = {k: COLLS[k] for k in only_list if k in COLLS}
+        targets = {k: collections[k] for k in only_list if k in collections}
 
     summary: Dict[str, int] = {}
     for tbl, spec in targets.items():
