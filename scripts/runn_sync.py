@@ -15,13 +15,14 @@ HDRS = {
 PROJ = os.environ["BQ_PROJECT"]
 DS   = os.environ["BQ_DATASET"]
 
-RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")  # opcional
+# Filtro opcional para holidays (si lo defines en el Job limitará el volumen)
+RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")  # p.ej. "17291"
 
 # -----------------------------------------------------------------------------
 # Catálogo de colecciones.
-# Valor puede ser:
-#   - str  -> solo path
-#   - (path, {params}) -> path + parámetros fijos de query
+#   Valor puede ser:
+#     - str  -> solo path
+#     - (path, {params}) -> path + parámetros fijos de query
 # -----------------------------------------------------------------------------
 COLLS: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = {
     # Base
@@ -94,18 +95,21 @@ def set_last_success(bq: bigquery.Client, name: str, ts: dt.datetime):
     ).result()
 
 # -----------------------
-# Helpers
+# Helpers de endpoint
 # -----------------------
 def _supports_modified_after(path: str) -> bool:
+    # Según docs: estos aceptan modifiedAfter
     tail = path.rstrip("/").split("/")[-1]
-    # según docs: actuals, assignments, contracts, placeholders aceptan modifiedAfter
     return tail in {"actuals", "assignments", "contracts", "placeholders"}
 
 def _accepts_date_window(path: str) -> bool:
-    # endpoints que aceptan dateFrom/dateTo/personId
+    # Endpoints con filtros por fecha/persona
     tail = path.rstrip("/").split("/")[-1]
     return tail in {"actuals", "assignments"}
 
+# -----------------------
+# Descarga paginada
+# -----------------------
 def fetch_all(path: str,
               since_iso: Optional[str],
               limit=200,
@@ -128,6 +132,7 @@ def fetch_all(path: str,
             time.sleep(int(r.headers.get("Retry-After", "5") or "5"))
             continue
         if r.status_code == 404:
+            # endpoint no disponible en el tenant/plan; no rompemos el job
             if os.environ.get("RUNN_DEBUG"):
                 print(f"[WARN] 404 Not Found: {API+path} params={params}  (ignorado)")
             return []
@@ -144,7 +149,7 @@ def fetch_all(path: str,
             break
 
     if os.environ.get("RUNN_DEBUG"):
-        print(f"[INFO] fetched {len(out)} rows from {path} (params={extra_params or {}})")
+        print(f"[INFO] fetched {len(out)} rows from {path} (params={extra_params or {}} since={since_iso})")
     return out
 
 # -----------------------
@@ -155,6 +160,11 @@ def purge_scope(bq: bigquery.Client,
                 person: Optional[str],
                 dfrom: Optional[str],
                 dto: Optional[str]) -> None:
+    """
+    Antes de un backfill dirigido (dateFrom/dateTo[/personId]) borramos la ventana
+    en la tabla destino para evitar duplicados o residuos de cargas previas.
+    Aplica a actuals/assignments (ambos tienen columna 'date').
+    """
     if not (dfrom and dto):
         return
     if table_base not in {"runn_actuals", "runn_assignments"}:
@@ -186,6 +196,10 @@ def purge_scope(bq: bigquery.Client,
 # Carga y MERGE a BQ
 # -----------------------
 def _create_empty_timeoff_table_if_needed(table_base: str, bq: bigquery.Client) -> None:
+    """
+    Crea tabla vacía para timeoffs si el endpoint devolvió 0 filas,
+    para que no fallen vistas que la referencian.
+    """
     if table_base not in {"runn_timeoffs_leave", "runn_timeoffs_rostered"}:
         return
     tgt = f"{PROJ}.{DS}.{table_base}"
@@ -215,6 +229,7 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     stg = f"{PROJ}.{DS}._stg__{table_base}"
     tgt = f"{PROJ}.{DS}.{table_base}"
 
+    # 1) Carga staging con autodetección
     job = bq.load_table_from_json(
         rows,
         stg,
@@ -228,11 +243,13 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     stg_tbl = bq.get_table(stg)
     stg_schema = stg_tbl.schema
 
+    # 2) Asegura target
     try:
         bq.get_table(tgt)
     except Exception:
         bq.create_table(bigquery.Table(tgt, schema=stg_schema))
 
+    # 3) MERGE por id (cast a STRING para evitar choques INT64/STRING)
     has_id = any(c.name == "id" for c in stg_schema)
     if has_id:
         cols = [c.name for c in stg_schema]
@@ -252,6 +269,7 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
           INSERT ({insert_cols}) VALUES ({insert_vals})
         """
     else:
+        # sin id: reemplazo total (mantengo tu comportamiento original)
         sql = f"CREATE OR REPLACE TABLE `{tgt}` AS SELECT * FROM `{stg}`"
 
     bq.query(sql).result()
@@ -261,6 +279,7 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
 # CLI helpers
 # -----------------------
 def parse_only(raw: Optional[List[str]]) -> Optional[List[str]]:
+    """Acepta --only repetido o lista separada por comas."""
     if not raw:
         return None
     out: List[str] = []
@@ -282,7 +301,7 @@ def main():
     ap.add_argument("--overlap-days", type=int, default=7, help="relee últimos N días en delta")
     ap.add_argument("--only", action="append", help="repetible o coma-separado: runn_people,runn_projects,…")
 
-    # backfill dirigido por rango/persona (para actuals/assignments)
+    # Backfill dirigido (actuals/assignments)
     ap.add_argument("--range-from", dest="range_from", help="YYYY-MM-DD")
     ap.add_argument("--range-to",   dest="range_to",   help="YYYY-MM-DD")
     ap.add_argument("--person-id",  dest="person_id",  help="filtrar por persona en backfill")
@@ -298,6 +317,7 @@ def main():
     # Inyecta param de filtro para holidays si viene RUNN_HOLIDAY_GROUP_ID
     collections: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = dict(COLLS)
     if RUNN_HOLIDAY_GROUP_ID:
+        # sobrescribe holidays con params (no rompe si ya existía simple)
         collections["runn_timeoffs_holidays"] = (
             "/time-offs/holidays/",
             {"holidayGroupId": RUNN_HOLIDAY_GROUP_ID}
@@ -333,12 +353,13 @@ def main():
         # ----- Decide filtro modifiedAfter (delta con solape) -----
         since_iso: Optional[str] = None
         use_modified_after = False
-        if args.range_from and args.range_to and _accepts_date_window(path):
+        if (args.range_from and args.range_to) and _accepts_date_window(path):
             # backfill dirigido: NO usamos modifiedAfter
             use_modified_after = False
         elif args.mode == "delta":
             last = get_last_success(bq, tbl)
             if last:
+                # Aplica solape para cazar correcciones tardías
                 overlap = dt.timedelta(days=max(args.overlap_days, 0))
                 since = last - overlap
             else:
@@ -363,17 +384,16 @@ def main():
         # ----- Actualiza estado (checkpoint) -----
         # Regla:
         # - Si hubo filas: usa max(updatedAt) si existe; si no, usa now.
-        # - Si no hubo filas:
+        # - Si NO hubo filas:
         #     * en delta con modifiedAfter: NO muevas checkpoint (evita saltarte cambios tardíos).
-        #     * en backfill (rango): sí podemos marcar now (opcional), pero no es necesario.
+        #     * en full/backfill sin modifiedAfter: no mover (comportamiento conservador).
         if rows:
-            # Busca updatedAt
+            # Busca updatedAt más reciente si está disponible
             max_upd = None
             for r in rows:
                 v = r.get("updatedAt") or r.get("updated_at")
                 if v:
                     try:
-                        # normaliza a datetime (asume formato ISOZ)
                         t = dt.datetime.fromisoformat(v.replace("Z","+00:00"))
                         if (max_upd is None) or (t > max_upd):
                             max_upd = t
@@ -381,10 +401,8 @@ def main():
                         pass
             set_last_success(bq, tbl, max_upd or now)
         else:
-            if not use_modified_after:
-                # en full/backfill sin modifiedAfter, podemos marcar now para no repetir,
-                # pero igual lo dejamos sin mover. Comportamiento conservador:
-                pass
+            # sin filas: no movemos checkpoint en delta (conservador)
+            pass
 
     print(json.dumps({"ok": True, "loaded": summary}, ensure_ascii=False))
 
