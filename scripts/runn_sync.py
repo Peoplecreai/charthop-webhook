@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple, Optional, Union
 from google.cloud import bigquery
 
 # -----------------------
-# Config HTTP / Entorno
+# Configuración
 # -----------------------
 API = "https://api.runn.io"
 HDRS = {
@@ -15,17 +15,20 @@ HDRS = {
 PROJ = os.environ["BQ_PROJECT"]
 DS   = os.environ["BQ_DATASET"]
 
-# Filtro opcional para holidays (si lo defines en el Job limitará el volumen)
+# Filtro opcional para holidays (para limitar volumen)
 RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")  # p.ej. "17291"
 
+# Delta solapado para no perder bordes (minutos)
+OVERLAP_MINUTES = int(os.environ.get("RUNN_OVERLAP_MINUTES", "1440"))  # 24h
+
 # -----------------------------------------------------------------------------
-# Catálogo de colecciones.
-# Valor puede ser:
-#   - str  -> solo path
-#   - (path, {params}) -> path + parámetros fijos de query
+# Catálogo de colecciones
+#   valor puede ser:
+#     - str                      -> path
+#     - (path, {params fijos})   -> path + query params
 # -----------------------------------------------------------------------------
 COLLS: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = {
-    # Base (ya existentes)
+    # Base
     "runn_people": "/people/",
     "runn_projects": "/projects/",
     "runn_clients": "/clients/",
@@ -40,10 +43,9 @@ COLLS: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = {
     "runn_actuals": "/actuals/",
     "runn_timeoffs_leave": "/time-offs/leave/",
     "runn_timeoffs_rostered": "/time-offs/rostered/",
-    # holidays con params opcionales (se agregan abajo en tiempo de ejecución)
-    "runn_timeoffs_holidays": "/time-offs/holidays/",
+    "runn_timeoffs_holidays": "/time-offs/holidays/",  # se inyecta holidayGroupId si existe env var
 
-    # Nuevas que pediste
+    # Nuevas
     "runn_holiday_groups": "/holiday-groups/",
     "runn_placeholders": ("/placeholders/", {}),
     "runn_contracts": ("/contracts/", {"sortBy": "id"}),
@@ -62,7 +64,7 @@ def state_table() -> str:
 def ensure_state_table(bq: bigquery.Client):
     bq.query(f"""
     CREATE TABLE IF NOT EXISTS `{state_table()}`(
-      table_name STRING NOT NULL,
+      table_name  STRING NOT NULL,
       last_success TIMESTAMP,
       PRIMARY KEY(table_name) NOT ENFORCED
     )""").result()
@@ -100,13 +102,24 @@ def set_last_success(bq: bigquery.Client, name: str, ts: dt.datetime):
 # -----------------------
 def _supports_modified_after(path: str) -> bool:
     tail = path.rstrip("/").split("/")[-1]
-    # según docs: actuals, assignments, contracts, placeholders aceptan modifiedAfter
+    # según docs: estos endpoints aceptan modifiedAfter
     return tail in {"actuals", "assignments", "contracts", "placeholders"}
 
-def fetch_all(path: str, since_iso: Optional[str], limit=200, extra_params: Optional[Dict[str,str]]=None) -> List[Dict]:
+def fetch_all(
+    path: str,
+    since_iso: Optional[str],
+    limit: int = 200,
+    extra_params: Optional[Dict[str, str]] = None
+) -> Tuple[List[Dict], Optional[dt.datetime]]:
+    """
+    Devuelve (rows, max_updatedAt_datetime)
+    """
     s = requests.Session(); s.headers.update(HDRS)
     out: List[Dict] = []
     cursor: Optional[str] = None
+    max_updated: Optional[dt.datetime] = None
+
+    endpoint = path.rstrip("/").split("/")[-1]
 
     while True:
         params: Dict[str, str] = {"limit": str(limit)}
@@ -125,7 +138,7 @@ def fetch_all(path: str, since_iso: Optional[str], limit=200, extra_params: Opti
             # endpoint no disponible en el tenant/plan; no rompemos el job
             if os.environ.get("RUNN_DEBUG"):
                 print(f"[WARN] 404 Not Found: {API+path} params={params}  (ignorado)")
-            return []
+            return [], None
         r.raise_for_status()
 
         payload = r.json()
@@ -134,13 +147,24 @@ def fetch_all(path: str, since_iso: Optional[str], limit=200, extra_params: Opti
             values = [values]
         out.extend(values)
 
+        # Trackear mayor updatedAt
+        for v in values:
+            upd = v.get("updatedAt") or v.get("updated_at")
+            if upd:
+                try:
+                    ts = dt.datetime.fromisoformat(upd.replace("Z", "+00:00"))
+                    if (max_updated is None) or (ts > max_updated):
+                        max_updated = ts
+                except Exception:
+                    pass
+
         cursor = payload.get("nextCursor")
         if not cursor:
             break
 
     if os.environ.get("RUNN_DEBUG"):
-        print(f"[INFO] fetched {len(out)} rows from {path} (params={extra_params or {}})")
-    return out
+        print(f"[INFO] fetched {len(out)} rows from /{endpoint} (params={extra_params or {}}; since={since_iso})")
+    return out, max_updated
 
 # -----------------------
 # Carga y MERGE a BQ
@@ -159,7 +183,6 @@ def _create_empty_timeoff_table_if_needed(table_base: str, bq: bigquery.Client) 
     except Exception:
         pass
 
-    # esquema mínimo razonable (coincide con campos típicos del API)
     schema = [
         bigquery.SchemaField("id", "STRING"),
         bigquery.SchemaField("personId", "STRING"),
@@ -174,14 +197,13 @@ def _create_empty_timeoff_table_if_needed(table_base: str, bq: bigquery.Client) 
 
 def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     if not rows:
-        # crea tabla vacía para leave/rostered si no existe
         _create_empty_timeoff_table_if_needed(table_base, bq)
         return 0
 
     stg = f"{PROJ}.{DS}._stg__{table_base}"
     tgt = f"{PROJ}.{DS}.{table_base}"
 
-    # 1) Carga staging con autodetección
+    # 1) Carga staging
     job = bq.load_table_from_json(
         rows,
         stg,
@@ -227,7 +249,7 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     return bq.get_table(tgt).num_rows
 
 # -----------------------
-# CLI
+# Utilidades CLI
 # -----------------------
 def parse_only(raw: Optional[List[str]]) -> Optional[List[str]]:
     """Acepta --only repetido o lista separada por comas."""
@@ -243,6 +265,9 @@ def parse_only(raw: Optional[List[str]]) -> Optional[List[str]]:
             seen.add(k); ordered.append(k)
     return ordered
 
+# -----------------------
+# Main
+# -----------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["full","delta"], default="delta")
@@ -251,22 +276,19 @@ def main():
     args = ap.parse_args()
 
     only_list = parse_only(args.only)
-
     bq = bigquery.Client(project=PROJ)
     ensure_state_table(bq)
 
     now = dt.datetime.now(dt.timezone.utc)
 
-    # Inyecta param de filtro para holidays si viene RUNN_HOLIDAY_GROUP_ID
+    # Inyecta param para holidays si viene RUNN_HOLIDAY_GROUP_ID
     collections: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = dict(COLLS)
     if RUNN_HOLIDAY_GROUP_ID:
-        # sobrescribe holidays con params (no rompe si ya existía simple)
         collections["runn_timeoffs_holidays"] = (
             "/time-offs/holidays/",
             {"holidayGroupId": RUNN_HOLIDAY_GROUP_ID}
         )
 
-    targets: Dict[str, Union[str, Tuple[str, Dict[str,str]]]]
     if not only_list:
         targets = collections
     else:
@@ -274,23 +296,27 @@ def main():
 
     summary: Dict[str, int] = {}
     for tbl, spec in targets.items():
-        if isinstance(spec, tuple):
-            path, extra = spec
-        else:
-            path, extra = spec, None
+        path, extra = (spec if isinstance(spec, tuple) else (spec, None))
 
+        # since con solape
         since_iso: Optional[str] = None
         if args.mode == "delta":
             last = get_last_success(bq, tbl)
             if last:
-                since_iso = last.strftime("%Y-%m-%dT%H:%M:%SZ")
-            elif path.rstrip("/").split("/")[-1] in {"actuals","assignments","contracts","placeholders"}:
-                since_iso = (now - dt.timedelta(days=args.delta_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                since = last - dt.timedelta(minutes=OVERLAP_MINUTES)
+                since_iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                tail = path.rstrip("/").split("/")[-1]
+                if tail in {"actuals","assignments","contracts","placeholders"}:
+                    since_iso = (now - dt.timedelta(days=args.delta_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        rows = fetch_all(path, since_iso, extra_params=extra)
+        rows, max_updated = fetch_all(path, since_iso, extra_params=extra)
         n = load_merge(tbl, rows, bq)
         summary[tbl] = int(n)
-        set_last_success(bq, tbl, now)
+
+        # guarda watermark real (max updatedAt) o now si no hubo
+        watermark = max_updated or now
+        set_last_success(bq, tbl, watermark)
 
     print(json.dumps({"ok": True, "loaded": summary}, ensure_ascii=False))
 
