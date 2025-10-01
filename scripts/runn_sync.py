@@ -16,13 +16,10 @@ PROJ = os.environ["BQ_PROJECT"]
 DS   = os.environ["BQ_DATASET"]
 
 # Filtro opcional para holidays (si lo defines en el Job limitará el volumen)
-RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")  # p.ej. "17291"
+RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")
 
 # -----------------------------------------------------------------------------
 # Catálogo de colecciones.
-#   Valor puede ser:
-#     - str  -> solo path
-#     - (path, {params}) -> path + parámetros fijos de query
 # -----------------------------------------------------------------------------
 COLLS: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = {
     # Base
@@ -50,6 +47,46 @@ COLLS: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = {
     # Custom Fields (ejemplos)
     "runn_custom_fields_checkbox_person":  ("/custom-fields/checkbox/", {"model": "PERSON"}),
     "runn_custom_fields_checkbox_project": ("/custom-fields/checkbox/", {"model": "PROJECT"}),
+}
+
+# -----------------------------------------------------------------------------
+# Esquemas destino "estables" (evita autodetecciones inconsistentes)
+# Solo declaramos donde nos importa fijar tipos.
+# -----------------------------------------------------------------------------
+SCHEMA_OVERRIDES: Dict[str, List[bigquery.SchemaField]] = {
+    "runn_actuals": [
+        bigquery.SchemaField("id", "STRING"),
+        bigquery.SchemaField("date", "DATE"),
+        bigquery.SchemaField("billableMinutes", "INT64"),
+        bigquery.SchemaField("nonbillableMinutes", "INT64"),
+        bigquery.SchemaField("phaseId", "INT64"),
+        bigquery.SchemaField("projectId", "INT64"),
+        bigquery.SchemaField("personId", "INT64"),
+        bigquery.SchemaField("roleId", "INT64"),
+        bigquery.SchemaField("workstreamId", "STRING"),
+        bigquery.SchemaField("updatedAt", "TIMESTAMP"),
+        bigquery.SchemaField("createdAt", "TIMESTAMP"),
+    ],
+    "runn_timeoffs_leave": [
+        bigquery.SchemaField("id", "STRING"),
+        bigquery.SchemaField("personId", "STRING"),
+        bigquery.SchemaField("startDate", "DATE"),
+        bigquery.SchemaField("endDate", "DATE"),
+        bigquery.SchemaField("note", "STRING"),
+        bigquery.SchemaField("createdAt", "TIMESTAMP"),
+        bigquery.SchemaField("updatedAt", "TIMESTAMP"),
+        bigquery.SchemaField("minutesPerDay", "INT64"),
+    ],
+    "runn_timeoffs_rostered": [
+        bigquery.SchemaField("id", "STRING"),
+        bigquery.SchemaField("personId", "STRING"),
+        bigquery.SchemaField("startDate", "DATE"),
+        bigquery.SchemaField("endDate", "DATE"),
+        bigquery.SchemaField("note", "STRING"),
+        bigquery.SchemaField("createdAt", "TIMESTAMP"),
+        bigquery.SchemaField("updatedAt", "TIMESTAMP"),
+        bigquery.SchemaField("minutesPerDay", "INT64"),
+    ],
 }
 
 # -----------------------
@@ -98,12 +135,10 @@ def set_last_success(bq: bigquery.Client, name: str, ts: dt.datetime):
 # Helpers de endpoint
 # -----------------------
 def _supports_modified_after(path: str) -> bool:
-    # Según docs: estos aceptan modifiedAfter
     tail = path.rstrip("/").split("/")[-1]
     return tail in {"actuals", "assignments", "contracts", "placeholders"}
 
 def _accepts_date_window(path: str) -> bool:
-    # Endpoints con filtros por fecha/persona
     tail = path.rstrip("/").split("/")[-1]
     return tail in {"actuals", "assignments"}
 
@@ -132,7 +167,6 @@ def fetch_all(path: str,
             time.sleep(int(r.headers.get("Retry-After", "5") or "5"))
             continue
         if r.status_code == 404:
-            # endpoint no disponible en el tenant/plan; no rompemos el job
             if os.environ.get("RUNN_DEBUG"):
                 print(f"[WARN] 404 Not Found: {API+path} params={params}  (ignorado)")
             return []
@@ -153,18 +187,159 @@ def fetch_all(path: str,
     return out
 
 # -----------------------
-# BQ: purga de ventana (para backfill)
+# BQ: helpers
+# -----------------------
+def _create_empty_timeoff_table_if_needed(table_base: str, bq: bigquery.Client) -> None:
+    if table_base not in {"runn_timeoffs_leave", "runn_timeoffs_rostered"}:
+        return
+    tgt = f"{PROJ}.{DS}.{table_base}"
+    try:
+        bq.get_table(tgt)
+        return
+    except Exception:
+        pass
+    schema = SCHEMA_OVERRIDES[table_base]
+    bq.create_table(bigquery.Table(tgt, schema=schema))
+
+def _schema_to_map(schema: List[bigquery.SchemaField]) -> Dict[str, str]:
+    return {c.name: c.field_type.upper() for c in schema}
+
+def _cast_expr(col: str, bq_type: str) -> str:
+    # id siempre como STRING para clave de MERGE
+    if col == "id":
+        return "CAST(id AS STRING) AS id"
+    t = bq_type.upper()
+    if t in {"STRING"}:
+        return f"CAST({col} AS STRING) AS {col}"
+    if t in {"INT64", "INTEGER"}:
+        return f"SAFE_CAST({col} AS INT64) AS {col}"
+    if t in {"FLOAT64", "FLOAT"}:
+        return f"SAFE_CAST({col} AS FLOAT64) AS {col}"
+    if t in {"BOOL", "BOOLEAN"}:
+        return f"SAFE_CAST({col} AS BOOL) AS {col}"
+    if t == "DATE":
+        return f"SAFE_CAST({col} AS DATE) AS {col}"
+    if t == "TIMESTAMP":
+        return f"SAFE_CAST({col} AS TIMESTAMP) AS {col}"
+    if t == "DATETIME":
+        return f"SAFE_CAST({col} AS DATETIME) AS {col}"
+    # por defecto sin cast
+    return f"{col} AS {col}"
+
+def _ensure_target_table(table_base: str, stg_schema: List[bigquery.SchemaField], bq: bigquery.Client) -> List[bigquery.SchemaField]:
+    """
+    Crea la tabla destino si no existe. Si hay override conocido, úsalo.
+    Devuelve el schema efectivo de destino.
+    """
+    tgt_id = f"{PROJ}.{DS}.{table_base}"
+    try:
+        tgt_tbl = bq.get_table(tgt_id)
+        return tgt_tbl.schema
+    except Exception:
+        pass
+
+    if table_base in SCHEMA_OVERRIDES:
+        schema = SCHEMA_OVERRIDES[table_base]
+        # particiona si hay columna date
+        has_date = any(c.name == "date" and c.field_type.upper()=="DATE" for c in schema)
+        if has_date:
+            q = f"""
+            CREATE TABLE `{tgt_id}`
+            PARTITION BY DATE(date)
+            CLUSTER BY personId, projectId
+            AS SELECT * FROM `{PROJ}.{DS}._stg__{table_base}` WHERE 1=0
+            """
+            # Creamos con DDL; luego ajustamos el esquema por exactitud
+            bq.query(q).result()
+            # Re-define esquema explícito (evita heredar autodetección)
+            bq.update_table(bigquery.Table(tgt_id, schema=schema), ["schema"])
+            return schema
+        else:
+            bq.create_table(bigquery.Table(tgt_id, schema=schema))
+            return schema
+    else:
+        # default: clona esquema de staging
+        bq.create_table(bigquery.Table(tgt_id, schema=stg_schema))
+        return stg_schema
+
+# -----------------------
+# Carga y MERGE a BQ (tipado contra destino)
+# -----------------------
+def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
+    if not rows:
+        _create_empty_timeoff_table_if_needed(table_base, bq)
+        return 0
+
+    stg = f"{PROJ}.{DS}._stg__{table_base}"
+    tgt = f"{PROJ}.{DS}.{table_base}"
+
+    # 1) Carga staging
+    job = bq.load_table_from_json(
+        rows,
+        stg,
+        job_config=bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            autodetect=True
+        )
+    )
+    job.result()
+
+    stg_schema = bq.get_table(stg).schema
+    # 2) Asegura destino (usa overrides si hay)
+    tgt_schema = _ensure_target_table(table_base, stg_schema, bq)
+
+    # 3) Construye SELECT tipado (S) para alinear a esquema destino
+    tgt_map = _schema_to_map(tgt_schema)
+    stg_cols = [c.name for c in stg_schema]
+
+    select_parts: List[str] = []
+    for col, bq_type in tgt_map.items():
+        if col in stg_cols:
+            select_parts.append(_cast_expr(col, bq_type))
+        else:
+            # columna está en destino pero no vino en staging -> NULL tipado
+            select_parts.append(f"CAST(NULL AS {bq_type}) AS {col}")
+    select_sql = ",\n    ".join(select_parts)
+
+    # columnas para MERGE (intersección menos id)
+    non_id_cols = [c for c in tgt_map.keys() if c != "id" and c in stg_cols]
+
+    set_clause  = ", ".join([f"T.{c}=S.{c}" for c in non_id_cols]) if non_id_cols else ""
+    insert_cols = ["id"] + [c for c in tgt_map.keys() if c != "id" and c in stg_cols]
+    insert_vals = ["S.id"] + [f"S.{c}" for c in insert_cols if c != "id"]
+
+    merge_sql = f"""
+    MERGE `{tgt}` T
+    USING (
+      SELECT
+        {select_sql}
+      FROM `{stg}`
+    ) S
+    ON CAST(T.id AS STRING) = S.id
+    """
+
+    if set_clause:
+        merge_sql += f"""
+    WHEN MATCHED THEN UPDATE SET
+      {set_clause}
+    """
+
+    merge_sql += f"""
+    WHEN NOT MATCHED THEN INSERT ({", ".join(insert_cols)})
+    VALUES ({", ".join(insert_vals)})
+    """
+
+    bq.query(merge_sql).result()
+    return bq.get_table(tgt).num_rows
+
+# -----------------------
+# Purga de ventana (para backfill por rango – sin personas hardcode)
 # -----------------------
 def purge_scope(bq: bigquery.Client,
                 table_base: str,
                 person: Optional[str],
                 dfrom: Optional[str],
                 dto: Optional[str]) -> None:
-    """
-    Antes de un backfill dirigido (dateFrom/dateTo[/personId]) borramos la ventana
-    en la tabla destino para evitar duplicados o residuos de cargas previas.
-    Aplica a actuals/assignments (ambos tienen columna 'date').
-    """
     if not (dfrom and dto):
         return
     if table_base not in {"runn_actuals", "runn_assignments"}:
@@ -193,93 +368,9 @@ def purge_scope(bq: bigquery.Client,
     bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
 
 # -----------------------
-# Carga y MERGE a BQ
-# -----------------------
-def _create_empty_timeoff_table_if_needed(table_base: str, bq: bigquery.Client) -> None:
-    """
-    Crea tabla vacía para timeoffs si el endpoint devolvió 0 filas,
-    para que no fallen vistas que la referencian.
-    """
-    if table_base not in {"runn_timeoffs_leave", "runn_timeoffs_rostered"}:
-        return
-    tgt = f"{PROJ}.{DS}.{table_base}"
-    try:
-        bq.get_table(tgt)
-        return
-    except Exception:
-        pass
-
-    schema = [
-        bigquery.SchemaField("id", "STRING"),
-        bigquery.SchemaField("personId", "STRING"),
-        bigquery.SchemaField("startDate", "DATE"),
-        bigquery.SchemaField("endDate", "DATE"),
-        bigquery.SchemaField("note", "STRING"),
-        bigquery.SchemaField("createdAt", "TIMESTAMP"),
-        bigquery.SchemaField("updatedAt", "TIMESTAMP"),
-        bigquery.SchemaField("minutesPerDay", "INT64"),
-    ]
-    bq.create_table(bigquery.Table(tgt, schema=schema))
-
-def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
-    if not rows:
-        _create_empty_timeoff_table_if_needed(table_base, bq)
-        return 0
-
-    stg = f"{PROJ}.{DS}._stg__{table_base}"
-    tgt = f"{PROJ}.{DS}.{table_base}"
-
-    # 1) Carga staging con autodetección
-    job = bq.load_table_from_json(
-        rows,
-        stg,
-        job_config=bigquery.LoadJobConfig(
-            write_disposition="WRITE_TRUNCATE",
-            autodetect=True
-        )
-    )
-    job.result()
-
-    stg_tbl = bq.get_table(stg)
-    stg_schema = stg_tbl.schema
-
-    # 2) Asegura target
-    try:
-        bq.get_table(tgt)
-    except Exception:
-        bq.create_table(bigquery.Table(tgt, schema=stg_schema))
-
-    # 3) MERGE por id (cast a STRING para evitar choques INT64/STRING)
-    has_id = any(c.name == "id" for c in stg_schema)
-    if has_id:
-        cols = [c.name for c in stg_schema]
-        non_id_cols = [c for c in cols if c != "id"]
-
-        set_clause  = ", ".join([f"T.{c}=S.{c}" for c in non_id_cols])
-        insert_cols = ", ".join(["id"] + non_id_cols)
-        insert_vals = ", ".join(["CAST(S.id AS STRING)"] + [f"S.{c}" for c in non_id_cols])
-
-        sql = f"""
-        MERGE `{tgt}` AS T
-        USING `{stg}` AS S
-        ON CAST(T.id AS STRING) = CAST(S.id AS STRING)
-        WHEN MATCHED THEN
-          UPDATE SET {set_clause}
-        WHEN NOT MATCHED THEN
-          INSERT ({insert_cols}) VALUES ({insert_vals})
-        """
-    else:
-        # sin id: reemplazo total (mantengo tu comportamiento original)
-        sql = f"CREATE OR REPLACE TABLE `{tgt}` AS SELECT * FROM `{stg}`"
-
-    bq.query(sql).result()
-    return bq.get_table(tgt).num_rows
-
-# -----------------------
 # CLI helpers
 # -----------------------
 def parse_only(raw: Optional[List[str]]) -> Optional[List[str]]:
-    """Acepta --only repetido o lista separada por comas."""
     if not raw:
         return None
     out: List[str] = []
@@ -301,10 +392,10 @@ def main():
     ap.add_argument("--overlap-days", type=int, default=7, help="relee últimos N días en delta")
     ap.add_argument("--only", action="append", help="repetible o coma-separado: runn_people,runn_projects,…")
 
-    # Backfill dirigido (actuals/assignments)
+    # Backfill dirigido (rango global por fechas; persona opcional, NO hardcode)
     ap.add_argument("--range-from", dest="range_from", help="YYYY-MM-DD")
     ap.add_argument("--range-to",   dest="range_to",   help="YYYY-MM-DD")
-    ap.add_argument("--person-id",  dest="person_id",  help="filtrar por persona en backfill")
+    ap.add_argument("--person-id",  dest="person_id",  help="filtrar por persona (opcional)")
 
     args = ap.parse_args()
     only_list = parse_only(args.only)
@@ -314,34 +405,27 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
 
-    # Inyecta param de filtro para holidays si viene RUNN_HOLIDAY_GROUP_ID
+    # Filtro de holiday group, si aplica
     collections: Dict[str, Union[str, Tuple[str, Dict[str, str]]]] = dict(COLLS)
     if RUNN_HOLIDAY_GROUP_ID:
-        # sobrescribe holidays con params (no rompe si ya existía simple)
         collections["runn_timeoffs_holidays"] = (
             "/time-offs/holidays/",
             {"holidayGroupId": RUNN_HOLIDAY_GROUP_ID}
         )
 
-    if not only_list:
-        targets = collections
-    else:
-        targets = {k: collections[k] for k in only_list if k in collections}
-
+    targets = collections if not only_list else {k: collections[k] for k in only_list if k in collections}
     summary: Dict[str, int] = {}
 
     for tbl, spec in targets.items():
-        if isinstance(spec, tuple):
-            path, fixed_params = spec
-        else:
-            path, fixed_params = spec, None
+        path, fixed_params = (spec if isinstance(spec, tuple) else (spec, None))
 
         last_checkpoint = get_last_success(bq, tbl)
-        # ----- Construye parámetros dinámicos -----
+
+        # ----- Parámetros dinámicos (fecha/persona, sin hardcodeos) -----
         dyn_params: Dict[str, Optional[str]] = {}
         purge_from: Optional[str] = None
         purge_to: Optional[str] = None
-        # Para actuals/assignments permite rango + persona
+
         if _accepts_date_window(path):
             if args.range_from and args.range_to:
                 dyn_params["dateFrom"] = args.range_from
@@ -349,44 +433,37 @@ def main():
                 purge_from, purge_to = args.range_from, args.range_to
             if args.person_id:
                 dyn_params["personId"] = args.person_id
-            # En modo delta sin rango explícito refrescamos una ventana móvil.
+
             if (args.mode == "delta") and not (args.range_from and args.range_to):
                 window_days = max(args.delta_days, args.overlap_days, 0)
                 start_date = (now - dt.timedelta(days=window_days)).date().isoformat()
-                forward_days = max(args.delta_days, 0)
-                end_date = (now + dt.timedelta(days=forward_days)).date().isoformat()
+                # no asumimos futuro; si RUNN entregara futuros, puedes ajustar aquí
+                end_date = now.date().isoformat()
                 dyn_params.setdefault("dateFrom", start_date)
                 dyn_params.setdefault("dateTo", end_date)
                 purge_from = dyn_params.get("dateFrom")
-                purge_to = dyn_params.get("dateTo")
+                purge_to   = dyn_params.get("dateTo")
 
-        # Mezcla fixed + dinámicos
         extra = dict(fixed_params or {})
         extra.update({k: v for k, v in dyn_params.items() if v})
 
-        # ----- Decide filtro modifiedAfter (delta con solape) -----
+        # ----- Strategy modifiedAfter vs ventana -----
         since_iso: Optional[str] = None
         use_modified_after = False
         if (args.range_from and args.range_to) and _accepts_date_window(path):
-            # backfill dirigido: NO usamos modifiedAfter
             use_modified_after = False
         elif purge_from and purge_to and _accepts_date_window(path):
-            # Ventana móvil: recargamos todo el rango definido
             use_modified_after = False
         elif args.mode == "delta":
             if last_checkpoint:
-                # Aplica solape para cazar correcciones tardías
                 overlap = dt.timedelta(days=max(args.overlap_days, 0))
                 since = last_checkpoint - overlap
             else:
                 since = now - dt.timedelta(days=args.delta_days)
             since_iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
             use_modified_after = _supports_modified_after(path)
-        else:
-            # full sin modifiedAfter
-            use_modified_after = False
 
-        # ----- Purga de ventana si procede (antes de descargar) -----
+        # ----- Purga de ventana (si procede) -----
         if tbl in {"runn_actuals", "runn_assignments"} and purge_from and purge_to:
             purge_scope(bq, tbl, args.person_id, purge_from, purge_to)
 
@@ -397,31 +474,22 @@ def main():
         n = load_merge(tbl, rows, bq)
         summary[tbl] = int(n)
 
-        # ----- Actualiza estado (checkpoint) -----
-        # Regla:
-        # - Si hubo filas: usa max(updatedAt) si existe; si no, usa now.
-        # - Si NO hubo filas:
-        #     * en delta con modifiedAfter: NO muevas checkpoint (evita saltarte cambios tardíos).
-        #     * en full/backfill sin modifiedAfter: no mover (comportamiento conservador).
+        # ----- Checkpoint -----
         if rows:
-            # Busca updatedAt más reciente si está disponible
             max_upd = None
             for r in rows:
                 v = r.get("updatedAt") or r.get("updated_at")
                 if v:
                     try:
                         t = dt.datetime.fromisoformat(v.replace("Z","+00:00"))
-                        if (max_upd is None) or (t > max_upd):
-                            max_upd = t
+                        max_upd = t if (max_upd is None or t > max_upd) else max_upd
                     except Exception:
                         pass
             new_checkpoint = max_upd or now
             if last_checkpoint and new_checkpoint < last_checkpoint:
                 new_checkpoint = last_checkpoint
             set_last_success(bq, tbl, new_checkpoint)
-        else:
-            # sin filas: no movemos checkpoint en delta (conservador)
-            pass
+        # si no hubo filas en delta, no movemos el checkpoint (conservador)
 
     print(json.dumps({"ok": True, "loaded": summary}, ensure_ascii=False))
 
