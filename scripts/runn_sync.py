@@ -336,15 +336,29 @@ def main():
         else:
             path, fixed_params = spec, None
 
+        last_checkpoint = get_last_success(bq, tbl)
         # ----- Construye parámetros dinámicos -----
         dyn_params: Dict[str, Optional[str]] = {}
+        purge_from: Optional[str] = None
+        purge_to: Optional[str] = None
         # Para actuals/assignments permite rango + persona
         if _accepts_date_window(path):
             if args.range_from and args.range_to:
                 dyn_params["dateFrom"] = args.range_from
                 dyn_params["dateTo"]   = args.range_to
+                purge_from, purge_to = args.range_from, args.range_to
             if args.person_id:
                 dyn_params["personId"] = args.person_id
+            # En modo delta sin rango explícito refrescamos una ventana móvil.
+            if (args.mode == "delta") and not (args.range_from and args.range_to):
+                window_days = max(args.delta_days, args.overlap_days, 0)
+                start_date = (now - dt.timedelta(days=window_days)).date().isoformat()
+                forward_days = max(args.delta_days, 0)
+                end_date = (now + dt.timedelta(days=forward_days)).date().isoformat()
+                dyn_params.setdefault("dateFrom", start_date)
+                dyn_params.setdefault("dateTo", end_date)
+                purge_from = dyn_params.get("dateFrom")
+                purge_to = dyn_params.get("dateTo")
 
         # Mezcla fixed + dinámicos
         extra = dict(fixed_params or {})
@@ -356,12 +370,14 @@ def main():
         if (args.range_from and args.range_to) and _accepts_date_window(path):
             # backfill dirigido: NO usamos modifiedAfter
             use_modified_after = False
+        elif purge_from and purge_to and _accepts_date_window(path):
+            # Ventana móvil: recargamos todo el rango definido
+            use_modified_after = False
         elif args.mode == "delta":
-            last = get_last_success(bq, tbl)
-            if last:
+            if last_checkpoint:
                 # Aplica solape para cazar correcciones tardías
                 overlap = dt.timedelta(days=max(args.overlap_days, 0))
-                since = last - overlap
+                since = last_checkpoint - overlap
             else:
                 since = now - dt.timedelta(days=args.delta_days)
             since_iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -371,8 +387,8 @@ def main():
             use_modified_after = False
 
         # ----- Purga de ventana si procede (antes de descargar) -----
-        if tbl in {"runn_actuals", "runn_assignments"} and (args.range_from and args.range_to):
-            purge_scope(bq, tbl, args.person_id, args.range_from, args.range_to)
+        if tbl in {"runn_actuals", "runn_assignments"} and purge_from and purge_to:
+            purge_scope(bq, tbl, args.person_id, purge_from, purge_to)
 
         # ----- Descarga -----
         rows = fetch_all(path, since_iso if use_modified_after else None, extra_params=extra)
@@ -399,7 +415,10 @@ def main():
                             max_upd = t
                     except Exception:
                         pass
-            set_last_success(bq, tbl, max_upd or now)
+            new_checkpoint = max_upd or now
+            if last_checkpoint and new_checkpoint < last_checkpoint:
+                new_checkpoint = last_checkpoint
+            set_last_success(bq, tbl, new_checkpoint)
         else:
             # sin filas: no movemos checkpoint en delta (conservador)
             pass
