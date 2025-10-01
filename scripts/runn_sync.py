@@ -306,7 +306,7 @@ def main():
                 since = last - dt.timedelta(minutes=OVERLAP_MINUTES)
                 if _supports_modified_after(path):
                     baseline = now - dt.timedelta(days=args.delta_days)
-                    if since > baseline:
+                    if since < baseline:
                         since = baseline
                 since_iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
