@@ -221,10 +221,12 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
             first = (p.get("name.first") or "").strip()
             last = (p.get("name.last") or "").strip()
 
-            if pref_first or pref_last:
-                name = f"{pref_first} {pref_last}".strip()
+            name_first = pref_first or first
+            name_last = pref_last or last
+            if name_first or name_last:
+                name = f"{name_first} {name_last}".strip()
             else:
-                name = f"{first} {last}".strip()
+                name = ""
 
             manager_email = (p.get("manager.contact.workEmail") or "").strip()
             city = (p.get("address.city") or "").strip()
