@@ -216,17 +216,17 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
             )
             ch_person_id = (p.get("id") or "").strip()
 
-           pref_first = str(p.get("name.pref") or "").strip()
-           pref_last  = str(p.get("name.preflast") or "").strip()
-           first      = str(p.get("name.first") or "").strip()
-           last       = str(p.get("name.last") or "").strip()
+            pref_first = (p.get("name.pref") or "").strip()
+            pref_last = (p.get("name.preflast") or "").strip()
+            first = (p.get("name.first") or "").strip()
+            last = (p.get("name.last") or "").strip()
 
-           # Fallbacks efectivos: si no hay preferred, usa legales
-           name_first = pref_first if pref_first else first
-           name_last  = pref_last  if pref_last else last
-
-            # Nombre final sin dobles espacios ni None
-            name = " ".join(x for x in (name_first, name_last) if x)
+            name_first = pref_first or first
+            name_last = pref_last or last
+            if name_first or name_last:
+                name = f"{name_first} {name_last}".strip()
+            else:
+                name = ""
 
             manager_email = (p.get("manager.contact.workEmail") or "").strip()
             city = (p.get("address.city") or "").strip()
@@ -251,7 +251,7 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
                 "Employee Id": emp_id,
                 "Email": email,
                 "Name": name,
-                "Preferred Name": name_first,
+                "Preferred Name": pref_first,
                 "Manager Email": manager_email,
                 "Manager": manager_email,
                 "Location": city,
