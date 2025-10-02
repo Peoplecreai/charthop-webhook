@@ -91,6 +91,7 @@ PEOPLE_FIELDS = ",".join(
         "startDateOrg",
         "endDateOrg",
         "department.name",
+        "gender",
     ]
 )
 
@@ -180,6 +181,7 @@ CULTURE_AMP_COLUMNS = [
     "Department",
     "Country",
     "Employment Type",
+    "Gender",
 ]
 
 def _norm_date_str(s: Optional[str]) -> str:
@@ -237,6 +239,7 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
             start_date = _norm_date_str(p.get("startDateOrg"))
             end_date = _norm_date_str(p.get("endDateOrg"))
             department = (p.get("department.name") or "").strip()
+            gender = (p.get("gender") or "").strip()
 
             job_id = (p.get("jobId") or "").strip()
             if job_id:
@@ -263,6 +266,7 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
                 "Department": department,
                 "Country": country,
                 "Employment Type": employment,
+                "Gender": gender,
             }
             yield row, ch_person_id
     finally:
