@@ -171,6 +171,7 @@ CULTURE_AMP_COLUMNS = [
     "Name",
     "Preferred Name",
     "Manager Email",
+    "Manager",
     "Location",
     "Job Title",
     "Seniority",
