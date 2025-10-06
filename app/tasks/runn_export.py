@@ -6,6 +6,6 @@ bp_tasks = Blueprint("tasks", __name__, url_prefix="/tasks")
 
 @bp_tasks.post("/export-runn")
 def run_export_runn():
-    window_days = int(request.args.get("window_days", "120"))
+    window_days = max(int(request.args.get("window_days", "60")), 0)
     result = export_runn_snapshot(window_days=window_days)
-    return jsonify({"ok": True, "result": result}), 200
+    return jsonify(result), 200
