@@ -19,6 +19,7 @@ HDRS = {
 }
 PROJ = os.environ["BQ_PROJECT"]
 DS = os.environ["BQ_DATASET"]
+LOCATION = os.environ.get("BIGQUERY_LOCATION", "US")
 
 # Filtro opcional para holidays (si lo defines en el Job limitará el volumen)
 RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")
@@ -284,11 +285,16 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
 
     tgt_map = _schema_to_map(tgt_schema)
     stg_cols = [c.name for c in stg_schema]
+    stg_repeated = {c.name for c in stg_schema if getattr(c, "mode", "").upper() == "REPEATED"}
 
     select_parts: List[str] = []
     for col, bq_type in tgt_map.items():
         if col in stg_cols:
-            select_parts.append(_cast_expr(col, bq_type))
+            # Si la fuente es ARRAY y el destino es STRING, toma el primer elemento
+            if bq_type.upper() == "STRING" and col in stg_repeated:
+                select_parts.append(f"{col}[SAFE_OFFSET(0)] AS {col}")
+            else:
+                select_parts.append(_cast_expr(col, bq_type))
         else:
             select_parts.append(f"CAST(NULL AS {bq_type}) AS {col}")
     select_sql = ",\n    ".join(select_parts)
@@ -385,7 +391,7 @@ def run_sync(
 ) -> Dict[str, Dict[str, int]]:
     only_list = parse_only(only)
 
-    bq = bigquery.Client(project=PROJ)
+    bq = bigquery.Client(project=PROJ, location=LOCATION)
     ensure_state_table(bq)
 
     now = dt.datetime.now(dt.timezone.utc)
