@@ -5,10 +5,11 @@ import datetime as dt
 import json
 import os
 import time
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import requests
 from google.cloud import bigquery
+from google.cloud.bigquery import SchemaField
 
 
 API = "https://api.runn.io"
@@ -17,7 +18,7 @@ HDRS = {
     "Accept-Version": "1.0.0",
     "Accept": "application/json",
 }
-PROJ = os.environ["BQ_PROJECT"]
+PROJ = os.environ.get("BQ_PROJECT", "integration-hub-468417")
 DS = os.environ["BQ_DATASET"]
 LOCATION = os.environ.get("BIGQUERY_LOCATION", "US")
 
@@ -215,6 +216,14 @@ def _schema_to_map(schema: Sequence[bigquery.SchemaField]) -> Dict[str, str]:
     return {c.name: c.field_type.upper() for c in schema}
 
 
+def _schema_is_repeated(f: SchemaField) -> bool:
+    return ((getattr(f, "mode", None) or "").upper() == "REPEATED")
+
+
+def _collect_repeated_columns(schema: Sequence[SchemaField]) -> Set[str]:
+    return {f.name for f in schema if _schema_is_repeated(f)}
+
+
 def _cast_expr(col: str, bq_type: str) -> str:
     if col == "id":
         return "CAST(id AS STRING) AS id"
@@ -284,20 +293,19 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     tgt_schema = _ensure_target_table(table_base, stg_schema, bq)
 
     tgt_map = _schema_to_map(tgt_schema)
-    stg_cols = [c.name for c in stg_schema]
-    stg_repeated = {c.name for c in stg_schema if getattr(c, "mode", "").upper() == "REPEATED"}
+    stg_cols = {c.name for c in stg_schema}
+    stg_repeated = _collect_repeated_columns(stg_schema)
 
     select_parts: List[str] = []
     for col, bq_type in tgt_map.items():
         if col in stg_cols:
-            # Si la fuente es ARRAY y el destino es STRING, toma el primer elemento
-            if bq_type.upper() == "STRING" and col in stg_repeated:
+            if col in stg_repeated and bq_type.upper() == "STRING":
                 select_parts.append(f"{col}[SAFE_OFFSET(0)] AS {col}")
             else:
                 select_parts.append(_cast_expr(col, bq_type))
         else:
             select_parts.append(f"CAST(NULL AS {bq_type}) AS {col}")
-    select_sql = ",\n    ".join(select_parts)
+    select_clause = ",\n  ".join(select_parts)
 
     non_id_cols = [c for c in tgt_map.keys() if c != "id" and c in stg_cols]
     set_clause = ", ".join([f"T.{c}=S.{c}" for c in non_id_cols]) if non_id_cols else ""
@@ -308,7 +316,7 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     MERGE `{tgt}` T
     USING (
       SELECT
-        {select_sql}
+        {select_clause}
       FROM `{stg}`
     ) S
     ON CAST(T.id AS STRING) = S.id
@@ -325,6 +333,7 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
     VALUES ({", ".join(insert_vals)})
     """
 
+    print("[DEBUG] MERGE SQL:\n" + merge_sql, flush=True)
     bq.query(merge_sql).result()
     return bq.get_table(tgt).num_rows
 
