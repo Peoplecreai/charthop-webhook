@@ -13,7 +13,14 @@ HDRS = {
     "Accept": "application/json",
 }
 PROJ = os.environ["BQ_PROJECT"]
-DS   = "people_analytics"
+# =============================================================================
+# CAMBIO FORZADO: Ignoramos la variable de entorno y usamos el valor correcto.
+# =============================================================================
+DS   = "people_analytics" 
+
+# Imprimimos los valores para estar 100% seguros de lo que se está usando
+print(f"DEBUG: Usando proyecto BQ '{PROJ}' y dataset '{DS}'")
+# =============================================================================
 
 # Filtro opcional para holidays (si lo defines en el Job limitará el volumen)
 RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")
@@ -299,7 +306,7 @@ def load_merge(table_base: str, rows: List[Dict], bq: bigquery.Client) -> int:
         else:
             # columna está en destino pero no vino en staging -> NULL tipado
             select_parts.append(f"CAST(NULL AS {bq_type}) AS {col}")
-    select_sql = ",\n    ".join(select_parts)
+    select_sql = ",\\n    ".join(select_parts)
 
     # columnas para MERGE (intersección menos id)
     non_id_cols = [c for c in tgt_map.keys() if c != "id" and c in stg_cols]
