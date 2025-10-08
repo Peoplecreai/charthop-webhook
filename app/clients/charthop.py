@@ -159,10 +159,6 @@ def ch_get_job_employment(job_id: str, session: Optional[Session] = None) -> Opt
 # =========================
 
 def ch_find_job(job_id: str, fields: str = "id,title,open,fields", session: Optional[Session] = None) -> Optional[Dict]:
-    """
-    Obtiene un Job por id usando v2: /org/{org}/job/{id}.
-    Devuelve el dict del job o None si no existe.
-    """
     job_id = (job_id or "").strip()
     if not job_id:
         return None
@@ -180,13 +176,7 @@ def ch_find_job(job_id: str, fields: str = "id,title,open,fields", session: Opti
         if own:
             session.close()
 
-
 def ch_upsert_job_field(job_id: str, field_label: str, value: str, session: Optional[Session] = None):
-    """
-    Actualiza un custom field de un Job (PATCH v2):
-    PATCH /org/{org}/job/{id} con body {"fields": {label: value}}.
-    Retorna el Response (levanta excepción en status no-2xx).
-    """
     job_id = (job_id or "").strip()
     field_label = (field_label or "").strip()
     if not job_id or not field_label:
@@ -204,7 +194,6 @@ def ch_upsert_job_field(job_id: str, field_label: str, value: str, session: Opti
     finally:
         if own:
             session.close()
-
 
 # =========================
 #   Culture Amp rows
