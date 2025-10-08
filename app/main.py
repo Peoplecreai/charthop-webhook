@@ -26,3 +26,10 @@ def root():
     if "resource_id" in payload:
         return tt_handler()
     return ch_handler()
+
+# al final del archivo
+if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 8080))
+    # importante: 0.0.0.0 para que Cloud Run pase el healthcheck
+    app.run(host="0.0.0.0", port=port)
