@@ -10,4 +10,4 @@ COPY app ./app
 
 # Puerto por defecto de Flask
 ENV PORT=8080
-CMD ["python", "-m", "app.main"]
+CMD ["sh", "-c", "gunicorn -b :${PORT:-8080} app.main:app"]
