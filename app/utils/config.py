@@ -7,7 +7,7 @@ from typing import Tuple
 
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
-
+CH_PEOPLE_PAGE_SIZE = int(os.getenv("CH_PEOPLE_PAGE_SIZE", "200"))
 
 # =========================
 # ChartHop
