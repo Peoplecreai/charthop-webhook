@@ -13,7 +13,7 @@ HDRS = {
     "Accept": "application/json",
 }
 PROJ = os.environ["BQ_PROJECT"]
-DS   = os.environ["BQ_DATASET"]
+DS   = "people_analytics"
 
 # Filtro opcional para holidays (si lo defines en el Job limitará el volumen)
 RUNN_HOLIDAY_GROUP_ID = os.environ.get("RUNN_HOLIDAY_GROUP_ID")
