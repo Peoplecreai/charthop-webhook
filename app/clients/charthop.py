@@ -155,6 +155,58 @@ def ch_get_job_employment(job_id: str, session: Optional[Session] = None) -> Opt
 
 
 # =========================
+#   Jobs (v2): lookup & update fields  ← (NUEVO)
+# =========================
+
+def ch_find_job(job_id: str, fields: str = "id,title,open,fields", session: Optional[Session] = None) -> Optional[Dict]:
+    """
+    Obtiene un Job por id usando v2: /org/{org}/job/{id}.
+    Devuelve el dict del job o None si no existe.
+    """
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return None
+    own = False
+    if session is None:
+        session = _new_session()
+        own = True
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        payload = _get_json(session, url, {"fields": fields})
+        if not payload or not isinstance(payload, dict):
+            return None
+        return payload
+    finally:
+        if own:
+            session.close()
+
+
+def ch_upsert_job_field(job_id: str, field_label: str, value: str, session: Optional[Session] = None):
+    """
+    Actualiza un custom field de un Job (PATCH v2):
+    PATCH /org/{org}/job/{id} con body {"fields": {label: value}}.
+    Retorna el Response (levanta excepción en status no-2xx).
+    """
+    job_id = (job_id or "").strip()
+    field_label = (field_label or "").strip()
+    if not job_id or not field_label:
+        raise ValueError("job_id and field_label are required")
+    own = False
+    if session is None:
+        session = _new_session()
+        own = True
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        body = {"fields": {field_label: value}}
+        r = session.patch(url, json=body, headers=ch_headers(), timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        return r
+    finally:
+        if own:
+            session.close()
+
+
+# =========================
 #   Culture Amp rows
 # =========================
 
