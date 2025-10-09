@@ -6,8 +6,21 @@ import unicodedata
 from typing import Tuple
 
 
+def _int_env(var_name: str, default: int) -> int:
+    value = os.getenv(var_name)
+    if value is None:
+        return default
+    value = str(value).strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
-CH_PEOPLE_PAGE_SIZE = int(os.getenv("CH_PEOPLE_PAGE_SIZE", "200"))
+
 
 # =========================
 # ChartHop
@@ -15,7 +28,7 @@ CH_PEOPLE_PAGE_SIZE = int(os.getenv("CH_PEOPLE_PAGE_SIZE", "200"))
 CH_API = os.getenv("CH_API", "https://api.charthop.com")
 CH_ORG_ID = os.getenv("CH_ORG_ID")
 CH_API_TOKEN = os.getenv("CH_API_TOKEN")
-CH_PEOPLE_PAGE_SIZE = int(os.getenv("CH_PEOPLE_PAGE_SIZE", "100"))
+CH_PEOPLE_PAGE_SIZE = _int_env("CH_PEOPLE_PAGE_SIZE", 200)
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "es-LA")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "UTC")
 CORP_EMAIL_DOMAIN = os.getenv("CORP_EMAIL_DOMAIN")
