@@ -5,6 +5,8 @@ import io
 import json
 import hashlib
 import time
+import datetime as dt
+from collections import OrderedDict
 from typing import Dict, Iterable, Iterator, List, Optional
 
 from requests import Session
@@ -12,13 +14,16 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import HTTPError, Timeout, SSLError
 
-from app.utils.config import (
-    CH_API,
-    CH_ORG_ID,
-    CH_PEOPLE_PAGE_SIZE,
-    HTTP_TIMEOUT,
-    ch_headers,
-)
+from app.utils import config as _config
+
+AUTO_ASSIGN_WORK_EMAIL = _config.AUTO_ASSIGN_WORK_EMAIL
+CH_API = _config.CH_API
+CH_ORG_ID = _config.CH_ORG_ID
+CH_PEOPLE_PAGE_SIZE = getattr(_config, "CH_PEOPLE_PAGE_SIZE", 200)
+CORP_EMAIL_DOMAIN = _config.CORP_EMAIL_DOMAIN
+HTTP_TIMEOUT = _config.HTTP_TIMEOUT
+ch_headers = _config.ch_headers
+strip_accents_and_non_alnum = _config.strip_accents_and_non_alnum
 
 # =========================
 #   HTTP helpers
@@ -86,6 +91,7 @@ PEOPLE_FIELDS = ",".join(
         "startDateOrg",
         "endDateOrg",
         "department.name",
+        "gender",
     ]
 )
 
@@ -100,20 +106,22 @@ def ch_iter_people_v2(fields: str = PEOPLE_FIELDS, page_size: Optional[int] = No
     if limit <= 0:
         limit = 200
 
-    offset: Optional[str] = None
-    seen_offsets = set()
+    cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
 
     try:
         while True:
             params = {
                 "fields": fields,
-                "limit": str(limit),
-                "includeAll": "false",
+                "limit": limit,
+                "includeAll": False,
             }
-            if offset:
-                if offset in seen_offsets:
+            if cursor:
+                if cursor in seen_cursors:
                     break
-                params["offset"] = offset
+                # ChartHop v2 person listing (see /v2/org/{orgId}/person in the swagger)
+                # uses the `from` query parameter to continue pagination.
+                params["from"] = cursor
 
             payload = _get_json(session, url, params)
             data = payload.get("data") or []
@@ -128,8 +136,8 @@ def ch_iter_people_v2(fields: str = PEOPLE_FIELDS, page_size: Optional[int] = No
             next_token = payload.get("next")
             if not next_token:
                 break
-            seen_offsets.add(offset or "")
-            offset = str(next_token)
+            seen_cursors.add(cursor or "")
+            cursor = str(next_token)
     finally:
         session.close()
 
@@ -155,47 +163,6 @@ def ch_get_job_employment(job_id: str, session: Optional[Session] = None) -> Opt
 
 
 # =========================
-#   Jobs (v2): lookup & update fields  ← (NUEVO)
-# =========================
-
-def ch_find_job(job_id: str, fields: str = "id,title,open,fields", session: Optional[Session] = None) -> Optional[Dict]:
-    job_id = (job_id or "").strip()
-    if not job_id:
-        return None
-    own = False
-    if session is None:
-        session = _new_session()
-        own = True
-    try:
-        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
-        payload = _get_json(session, url, {"fields": fields})
-        if not payload or not isinstance(payload, dict):
-            return None
-        return payload
-    finally:
-        if own:
-            session.close()
-
-def ch_upsert_job_field(job_id: str, field_label: str, value: str, session: Optional[Session] = None):
-    job_id = (job_id or "").strip()
-    field_label = (field_label or "").strip()
-    if not job_id or not field_label:
-        raise ValueError("job_id and field_label are required")
-    own = False
-    if session is None:
-        session = _new_session()
-        own = True
-    try:
-        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
-        body = {"fields": {field_label: value}}
-        r = session.patch(url, json=body, headers=ch_headers(), timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        return r
-    finally:
-        if own:
-            session.close()
-
-# =========================
 #   Culture Amp rows
 # =========================
 
@@ -205,6 +172,7 @@ CULTURE_AMP_COLUMNS = [
     "Name",
     "Preferred Name",
     "Manager Email",
+    "Manager",
     "Location",
     "Job Title",
     "Seniority",
@@ -213,6 +181,7 @@ CULTURE_AMP_COLUMNS = [
     "Department",
     "Country",
     "Employment Type",
+    "Gender",
 ]
 
 def _norm_date_str(s: Optional[str]) -> str:
@@ -255,10 +224,12 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
             first = (p.get("name.first") or "").strip()
             last = (p.get("name.last") or "").strip()
 
-            if pref_first or pref_last:
-                name = f"{pref_first} {pref_last}".strip()
+            name_first = pref_first or first
+            name_last = pref_last or last
+            if name_first or name_last:
+                name = f"{name_first} {name_last}".strip()
             else:
-                name = f"{first} {last}".strip()
+                name = ""
 
             manager_email = (p.get("manager.contact.workEmail") or "").strip()
             city = (p.get("address.city") or "").strip()
@@ -268,6 +239,7 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
             start_date = _norm_date_str(p.get("startDateOrg"))
             end_date = _norm_date_str(p.get("endDateOrg"))
             department = (p.get("department.name") or "").strip()
+            gender = (p.get("gender") or "").strip()
 
             job_id = (p.get("jobId") or "").strip()
             if job_id:
@@ -285,6 +257,7 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
                 "Name": name,
                 "Preferred Name": pref_first,
                 "Manager Email": manager_email,
+                "Manager": manager_email,
                 "Location": city,
                 "Job Title": title,
                 "Seniority": seniority,
@@ -293,6 +266,7 @@ def iter_culture_amp_rows_with_ids() -> Iterator[tuple[Dict[str, str], str]]:
                 "Department": department,
                 "Country": country,
                 "Employment Type": employment,
+                "Gender": gender,
             }
             yield row, ch_person_id
     finally:
@@ -320,3 +294,452 @@ def culture_amp_csv_from_rows(rows: Iterable[Dict[str, str]]) -> str:
     for row in rows:
         writer.writerow(row)
     return sio.getvalue()
+
+
+# =========================
+#   Shared helpers
+# =========================
+
+
+def _extract_entity(payload: Dict) -> Dict:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        return payload
+    return {}
+
+
+def _normalize_date_arg(value: Optional[dt.date | dt.datetime]) -> Optional[dt.date]:
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    return None
+
+
+def _parse_iso_date(value: Optional[str]) -> Optional[dt.date]:
+    if not value:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    if len(value) >= 10:
+        value = value[:10]
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _stringify_fields(data: Dict[str, object]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for key, value in data.items():
+        if isinstance(value, str):
+            result[key] = value.strip()
+        elif value is None:
+            result[key] = ""
+        else:
+            result[key] = str(value)
+    return result
+
+
+# =========================
+#   Job helpers
+# =========================
+
+
+def ch_find_job(job_id: str) -> Optional[Dict]:
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return None
+    session = _new_session()
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        resp = session.get(url, params={"include": "fields"}, timeout=HTTP_TIMEOUT)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        try:
+            payload = resp.json() or {}
+        except ValueError:
+            return {}
+        entity = _extract_entity(payload)
+        return entity or payload
+    except HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            return None
+        raise
+    finally:
+        session.close()
+
+
+def ch_upsert_job_field(job_id: str, field_api_name: str, value: object) -> Dict:
+    job_id = (job_id or "").strip()
+    field_api_name = (field_api_name or "").strip()
+    if not job_id:
+        raise ValueError("job_id is required")
+    if not field_api_name:
+        raise ValueError("field_api_name is required")
+    session = _new_session()
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        payload = {"fields": {field_api_name: value}}
+        resp = session.patch(url, json=payload, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            body = {}
+        entity = _extract_entity(body)
+        return entity or body
+    finally:
+        session.close()
+
+
+# =========================
+#   Teamtailor hires helpers
+# =========================
+
+
+def _normalize_import_rows(rows: Iterable[Dict[str, object]]) -> tuple[List[OrderedDict[str, str]], List[str]]:
+    normalized: List[OrderedDict[str, str]] = []
+    fieldnames: List[str] = []
+    seen_fields: set[str] = set()
+    for row in rows:
+        if not row:
+            continue
+        ordered: OrderedDict[str, str] = OrderedDict()
+        for key, value in row.items():
+            if key is None:
+                continue
+            key_str = str(key).strip()
+            if not key_str:
+                continue
+            if key_str not in seen_fields:
+                fieldnames.append(key_str)
+                seen_fields.add(key_str)
+            if isinstance(value, str):
+                ordered[key_str] = value.strip()
+            elif value is None:
+                ordered[key_str] = ""
+            else:
+                ordered[key_str] = str(value)
+        if ordered:
+            normalized.append(ordered)
+    return normalized, fieldnames
+
+
+def ch_import_people_csv(rows: Iterable[Dict[str, object]]) -> Dict:
+    normalized_rows, fieldnames = _normalize_import_rows(rows)
+    if not normalized_rows:
+        return {"submitted": False, "reason": "no rows"}
+
+    if not fieldnames:
+        fieldnames = list(normalized_rows[0].keys())
+
+    sio = io.StringIO()
+    writer = csv.DictWriter(sio, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for row in normalized_rows:
+        writer.writerow(row)
+    csv_payload = sio.getvalue()
+
+    session = _new_session()
+    try:
+        create_resp = session.post(
+            f"{CH_API}/v1/org/{CH_ORG_ID}/import/csv",
+            json={"type": "person", "recordType": "person"},
+            timeout=HTTP_TIMEOUT,
+        )
+        create_resp.raise_for_status()
+        try:
+            create_body = create_resp.json() or {}
+        except ValueError:
+            create_body = {}
+        import_id = (
+            create_body.get("importId")
+            or create_body.get("import_id")
+            or create_body.get("id")
+        )
+        if not import_id:
+            raise RuntimeError("ChartHop CSV import did not return an importId")
+
+        data_resp = session.post(
+            f"{CH_API}/v1/org/{CH_ORG_ID}/import/csv/data",
+            json={"importId": import_id, "data": csv_payload, "hasHeaders": True},
+            timeout=HTTP_TIMEOUT,
+        )
+        data_resp.raise_for_status()
+
+        submit_resp = session.post(
+            f"{CH_API}/v1/org/{CH_ORG_ID}/import/csv/submit",
+            json={"importId": import_id, "options": {"sendInviteEmails": False}},
+            timeout=HTTP_TIMEOUT,
+        )
+        submit_resp.raise_for_status()
+        try:
+            submit_body = submit_resp.json() or {}
+        except ValueError:
+            submit_body = {}
+
+        result = {
+            "importId": import_id,
+            "rows": len(normalized_rows),
+            "submitted": True,
+        }
+        if submit_body:
+            result["response"] = submit_body
+        return result
+    finally:
+        session.close()
+
+
+def generate_unique_work_email(first_name: str, last_name: str) -> str:
+    if not AUTO_ASSIGN_WORK_EMAIL:
+        return ""
+    domain = (CORP_EMAIL_DOMAIN or "").strip().lower()
+    if not domain:
+        return ""
+    domain = domain.lstrip("@")
+    first_slug = strip_accents_and_non_alnum(first_name)
+    last_slug = strip_accents_and_non_alnum(last_name)
+    parts = [part for part in (first_slug, last_slug) if part]
+    base = ".".join(parts) if parts else "team"
+    base = base.strip(".") or "team"
+
+    existing: set[str] = set()
+    for person in ch_iter_people_v2("contact.workEmail,contact.personalEmail"):
+        work = (person.get("contact.workEmail") or "").strip().lower()
+        personal = (person.get("contact.personalEmail") or "").strip().lower()
+        if work:
+            existing.add(work)
+        if personal:
+            existing.add(personal)
+
+    candidate = f"{base}@{domain}"
+    if candidate not in existing:
+        return candidate
+
+    for idx in range(2, 1000):
+        candidate = f"{base}{idx}@{domain}"
+        if candidate not in existing:
+            return candidate
+
+    raise RuntimeError("No hay emails disponibles con el dominio corporativo")
+
+
+# =========================
+#   Runn integrations helpers
+# =========================
+
+
+PEOPLE_ONBOARD_FIELDS = ",".join(
+    [
+        "id",
+        "contact.employee",
+        "jobId",
+        "employmentType",
+        "contact.workEmail",
+        "contact.personalEmail",
+        "name.first",
+        "name.last",
+        "name.pref",
+        "name.preflast",
+        "name.full",
+        "manager.contact.workEmail",
+        "startDateOrg",
+        "endDateOrg",
+    ]
+)
+
+
+def ch_people_starting_between(
+    start: Optional[dt.date | dt.datetime], end: Optional[dt.date | dt.datetime]
+) -> List[Dict]:
+    start_date = _normalize_date_arg(start)
+    end_date = _normalize_date_arg(end)
+    results: List[Dict] = []
+    job_cache: Dict[str, Optional[str]] = {}
+    job_session = _new_session()
+    try:
+        for person in ch_iter_people_v2(PEOPLE_ONBOARD_FIELDS):
+            start_raw = (person.get("startDateOrg") or "").strip()
+            start_dt = _parse_iso_date(start_raw)
+            if start_dt is None:
+                continue
+            if start_date and start_dt < start_date:
+                continue
+            if end_date and start_dt > end_date:
+                continue
+
+            person_id = (person.get("id") or "").strip()
+            job_id = (person.get("jobId") or "").strip()
+            employment = (person.get("employmentType") or "").strip()
+            if not employment and job_id:
+                if job_id in job_cache:
+                    employment = job_cache[job_id] or ""
+                else:
+                    employment = ch_get_job_employment(job_id, session=job_session) or ""
+                    job_cache[job_id] = employment
+
+            pref_first = (person.get("name.pref") or "").strip()
+            pref_last = (person.get("name.preflast") or "").strip()
+            legal_first = (person.get("name.first") or "").strip()
+            legal_last = (person.get("name.last") or "").strip()
+            first_value = pref_first or legal_first
+            last_value = pref_last or legal_last
+            full_name = (person.get("name.full") or "").strip()
+            if not full_name:
+                full_name = f"{first_value} {last_value}".strip()
+
+            fields = {
+                "employee id": (person.get("contact.employee") or person_id),
+                "job id": job_id,
+                "name": full_name,
+                "name first": first_value,
+                "name last": last_value,
+                "employment type": employment,
+                "employmenttype": employment,
+                "start date": _norm_date_str(start_raw),
+                "startdate": _norm_date_str(start_raw),
+                "end date": _norm_date_str(person.get("endDateOrg")),
+                "contact workemail": (person.get("contact.workEmail") or ""),
+                "contact work email": (person.get("contact.workEmail") or ""),
+                "contact personalemail": (person.get("contact.personalEmail") or ""),
+                "manager contact workemail": (person.get("manager.contact.workEmail") or ""),
+            }
+            normalized_fields = _stringify_fields(fields)
+            results.append({
+                "id": person_id,
+                "jobId": job_id,
+                "fields": normalized_fields,
+            })
+    finally:
+        job_session.close()
+    return results
+
+
+def ch_person_primary_email(person: Dict) -> str:
+    if not isinstance(person, dict):
+        return ""
+    fields = person.get("fields") if isinstance(person.get("fields"), dict) else {}
+    candidate_keys = [
+        "contact workemail",
+        "work email",
+        "email",
+        "contact email",
+        "primary email",
+        "person contact workemail",
+        "contact personalemail",
+        "personal email",
+        "person contact personalemail",
+    ]
+    for key in candidate_keys:
+        value = (fields.get(key) or "") if fields else ""
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    flat_keys = [
+        "contact.workEmail",
+        "contact.email",
+        "contact.personalEmail",
+        "workEmail",
+        "email",
+    ]
+    for key in flat_keys:
+        value = (person.get(key) or "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def ch_fetch_timeoff(
+    start: Optional[dt.date | dt.datetime], end: Optional[dt.date | dt.datetime]
+) -> List[Dict]:
+    start_date = _normalize_date_arg(start)
+    end_date = _normalize_date_arg(end)
+    url = f"{CH_API}/v2/org/{CH_ORG_ID}/timeoff"
+    limit = CH_PEOPLE_PAGE_SIZE or 200
+    base_params = {
+        "limit": str(limit),
+        "include": "person",
+    }
+    if start_date:
+        base_params["startDate[gte]"] = start_date.isoformat()
+    if end_date:
+        base_params["startDate[lte]"] = end_date.isoformat()
+
+    events: List[Dict] = []
+    offset: Optional[str] = None
+    session = _new_session()
+    try:
+        while True:
+            params = dict(base_params)
+            if offset:
+                params["offset"] = offset
+            payload = _get_json(session, url, params)
+            data = payload.get("data") or []
+            if isinstance(data, dict):
+                data = [data]
+            if not data:
+                break
+
+            for entry in data:
+                fields_raw = dict(entry.get("fields") or {})
+                start_raw = fields_raw.get("start date") or entry.get("startDate") or entry.get("start")
+                end_raw = fields_raw.get("end date") or entry.get("endDate") or entry.get("end")
+                if start_raw:
+                    fields_raw["start date"] = _norm_date_str(start_raw)
+                    fields_raw["startdate"] = _norm_date_str(start_raw)
+                if end_raw:
+                    fields_raw["end date"] = _norm_date_str(end_raw)
+
+                if "reason" not in fields_raw and entry.get("reason"):
+                    fields_raw["reason"] = entry.get("reason")
+                if "type" not in fields_raw and entry.get("type"):
+                    fields_raw["type"] = entry.get("type")
+
+                person_info = entry.get("person") or {}
+                if isinstance(person_info, dict):
+                    person_fields = person_info.get("fields") or {}
+                    contact = person_info.get("contact") or {}
+                    work_email = (
+                        (person_fields.get("contact workemail") if isinstance(person_fields, dict) else None)
+                        or contact.get("workEmail")
+                        or contact.get("email")
+                    )
+                    personal_email = (
+                        (person_fields.get("contact personalemail") if isinstance(person_fields, dict) else None)
+                        or contact.get("personalEmail")
+                    )
+                    if work_email:
+                        fields_raw.setdefault("person contact workemail", work_email)
+                        fields_raw.setdefault("contact workemail", work_email)
+                    if personal_email:
+                        fields_raw.setdefault("person contact personalemail", personal_email)
+
+                normalized_fields = _stringify_fields(fields_raw)
+                entry_copy = dict(entry)
+                entry_copy["fields"] = normalized_fields
+                entry_copy["id"] = entry.get("id") or normalized_fields.get("id")
+
+                start_dt = _parse_iso_date(normalized_fields.get("start date"))
+                if start_dt is None:
+                    continue
+                if start_date and start_dt < start_date:
+                    continue
+                if end_date and start_dt > end_date:
+                    continue
+
+                events.append(entry_copy)
+
+            next_token = payload.get("next")
+            if not next_token:
+                break
+            offset = str(next_token)
+        return events
+    finally:
+        session.close()
