@@ -5,6 +5,7 @@ from typing import Dict, List
 
 from app.clients.charthop import (
     ch_fetch_timeoff,
+    ch_get_timeoff,
     ch_people_starting_between,
     ch_person_primary_email,
 )
@@ -63,6 +64,31 @@ def _timeoff_reason(entry: Dict) -> str:
     return "Leave"
 
 
+def _sync_timeoff_entry(entry: Dict) -> Dict:
+    fields = entry.get("fields") or {}
+    email = (fields.get("person contact workemail") or fields.get("contact workemail") or "").strip()
+    if not email:
+        email = (fields.get("person contact personalemail") or "").strip()
+    if not email:
+        return {"status": "skipped", "reason": "missing email", "entry": entry}
+    person = runn_find_person_by_email(email)
+    if not person or not person.get("id"):
+        return {"status": "skipped", "reason": "person not found", "email": email}
+    start_date = _safe_date(fields.get("start date") or entry.get("startDate") or "")
+    end_date = _safe_date(fields.get("end date") or entry.get("endDate") or start_date)
+    if not start_date:
+        return {"status": "skipped", "reason": "missing start date", "email": email}
+    reason = _timeoff_reason(entry)
+    resp = runn_create_leave(
+        person_id=person["id"],
+        starts_at=start_date,
+        ends_at=end_date or start_date,
+        reason=reason,
+        external_ref=str(entry.get("id") or fields.get("id") or ""),
+    )
+    return {"status": "synced" if resp else "error", "email": email, "response": resp}
+
+
 def sync_runn_timeoff(reference: dt.date | None = None) -> Dict:
     reference = reference or dt.date.today()
     start = reference - dt.timedelta(days=RUNN_TIMEOFF_LOOKBACK_DAYS)
@@ -70,29 +96,15 @@ def sync_runn_timeoff(reference: dt.date | None = None) -> Dict:
     events = ch_fetch_timeoff(start, end)
     results: List[Dict] = []
     for entry in events:
-        fields = entry.get("fields") or {}
-        email = (fields.get("person contact workemail") or fields.get("contact workemail") or "").strip()
-        if not email:
-            email = (fields.get("person contact personalemail") or "").strip()
-        if not email:
-            results.append({"status": "skipped", "reason": "missing email", "entry": entry})
-            continue
-        person = runn_find_person_by_email(email)
-        if not person or not person.get("id"):
-            results.append({"status": "skipped", "reason": "person not found", "email": email})
-            continue
-        start_date = _safe_date(fields.get("start date") or entry.get("startDate") or "")
-        end_date = _safe_date(fields.get("end date") or entry.get("endDate") or start_date)
-        if not start_date:
-            results.append({"status": "skipped", "reason": "missing start date", "email": email})
-            continue
-        reason = _timeoff_reason(entry)
-        resp = runn_create_leave(
-            person_id=person["id"],
-            starts_at=start_date,
-            ends_at=end_date or start_date,
-            reason=reason,
-            external_ref=str(entry.get("id") or fields.get("id") or ""),
-        )
-        results.append({"status": "synced" if resp else "error", "email": email, "response": resp})
+        result = _sync_timeoff_entry(entry)
+        results.append(result)
     return {"processed": len(events), "results": results}
+
+
+def sync_runn_timeoff_event(timeoff_id: str) -> Dict:
+    entry = ch_get_timeoff(timeoff_id)
+    if not entry:
+        return {"status": "error", "reason": "timeoff not found", "timeoff_id": timeoff_id}
+    result = _sync_timeoff_entry(entry)
+    result.setdefault("timeoff_id", entry.get("id") or timeoff_id)
+    return result

@@ -1,5 +1,6 @@
 from flask import Blueprint, request
 from app.services.job_sync import sync_job_create, sync_job_update
+from app.services.runn_sync import sync_runn_timeoff_event
 
 bp_ch = Blueprint("charthop_webhook", __name__)
 
@@ -15,8 +16,14 @@ def ch_webhook():
 
     print(f"CH evt: type={evtype} entity={entity} entity_id={entity_id}")
     is_job = entity in ("job", "jobs")
+    is_timeoff = entity in ("timeoff", "time off", "time-off")
     is_create = evtype in ("job.create", "job_create", "create")
     is_update = evtype in ("job.update", "job_update", "update", "change")
+
+    if is_timeoff and entity_id:
+        result = sync_runn_timeoff_event(entity_id)
+        print(f"CH timeoff sync result: {result}")
+        return "", 200
 
     if not is_job:
         return "", 200
