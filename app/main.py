@@ -4,12 +4,14 @@ from app.blueprints.charthop_webhook import bp_ch, ch_webhook as ch_handler
 from app.blueprints.teamtailor_webhook import bp_tt, tt_webhook as tt_handler
 from app.blueprints.cron import bp_cron
 from app.tasks.ca_export import bp_tasks  # <-- nuevo
+from app.tasks.charthop_worker import bp_charthop_tasks
 
 app = Flask(__name__)
 app.register_blueprint(bp_ch)
 app.register_blueprint(bp_tt)
 app.register_blueprint(bp_cron)
 app.register_blueprint(bp_tasks)  # <-- nuevo
+app.register_blueprint(bp_charthop_tasks)
 
 @app.route("/health", methods=["GET"])
 def health():
