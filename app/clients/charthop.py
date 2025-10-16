@@ -656,6 +656,61 @@ def ch_person_primary_email(person: Dict) -> str:
     return ""
 
 
+def _normalize_timeoff_entry(
+    entry: Dict,
+    *,
+    start_date: Optional[dt.date] = None,
+    end_date: Optional[dt.date] = None,
+) -> Optional[Dict]:
+    fields_raw = dict(entry.get("fields") or {})
+    start_raw = fields_raw.get("start date") or entry.get("startDate") or entry.get("start")
+    end_raw = fields_raw.get("end date") or entry.get("endDate") or entry.get("end")
+    if start_raw:
+        fields_raw["start date"] = _norm_date_str(start_raw)
+        fields_raw["startdate"] = _norm_date_str(start_raw)
+    if end_raw:
+        fields_raw["end date"] = _norm_date_str(end_raw)
+
+    if "reason" not in fields_raw and entry.get("reason"):
+        fields_raw["reason"] = entry.get("reason")
+    if "type" not in fields_raw and entry.get("type"):
+        fields_raw["type"] = entry.get("type")
+
+    person_info = entry.get("person") or {}
+    if isinstance(person_info, dict):
+        person_fields = person_info.get("fields") or {}
+        contact = person_info.get("contact") or {}
+        work_email = (
+            (person_fields.get("contact workemail") if isinstance(person_fields, dict) else None)
+            or contact.get("workEmail")
+            or contact.get("email")
+        )
+        personal_email = (
+            (person_fields.get("contact personalemail") if isinstance(person_fields, dict) else None)
+            or contact.get("personalEmail")
+        )
+        if work_email:
+            fields_raw.setdefault("person contact workemail", work_email)
+            fields_raw.setdefault("contact workemail", work_email)
+        if personal_email:
+            fields_raw.setdefault("person contact personalemail", personal_email)
+
+    normalized_fields = _stringify_fields(fields_raw)
+    entry_copy = dict(entry)
+    entry_copy["fields"] = normalized_fields
+    entry_copy["id"] = entry.get("id") or normalized_fields.get("id")
+
+    start_dt = _parse_iso_date(normalized_fields.get("start date"))
+    if start_dt is None:
+        return None
+    if start_date and start_dt < start_date:
+        return None
+    if end_date and start_dt > end_date:
+        return None
+
+    return entry_copy
+
+
 def ch_fetch_timeoff(
     start: Optional[dt.date | dt.datetime], end: Optional[dt.date | dt.datetime]
 ) -> List[Dict]:
@@ -688,58 +743,34 @@ def ch_fetch_timeoff(
                 break
 
             for entry in data:
-                fields_raw = dict(entry.get("fields") or {})
-                start_raw = fields_raw.get("start date") or entry.get("startDate") or entry.get("start")
-                end_raw = fields_raw.get("end date") or entry.get("endDate") or entry.get("end")
-                if start_raw:
-                    fields_raw["start date"] = _norm_date_str(start_raw)
-                    fields_raw["startdate"] = _norm_date_str(start_raw)
-                if end_raw:
-                    fields_raw["end date"] = _norm_date_str(end_raw)
-
-                if "reason" not in fields_raw and entry.get("reason"):
-                    fields_raw["reason"] = entry.get("reason")
-                if "type" not in fields_raw and entry.get("type"):
-                    fields_raw["type"] = entry.get("type")
-
-                person_info = entry.get("person") or {}
-                if isinstance(person_info, dict):
-                    person_fields = person_info.get("fields") or {}
-                    contact = person_info.get("contact") or {}
-                    work_email = (
-                        (person_fields.get("contact workemail") if isinstance(person_fields, dict) else None)
-                        or contact.get("workEmail")
-                        or contact.get("email")
-                    )
-                    personal_email = (
-                        (person_fields.get("contact personalemail") if isinstance(person_fields, dict) else None)
-                        or contact.get("personalEmail")
-                    )
-                    if work_email:
-                        fields_raw.setdefault("person contact workemail", work_email)
-                        fields_raw.setdefault("contact workemail", work_email)
-                    if personal_email:
-                        fields_raw.setdefault("person contact personalemail", personal_email)
-
-                normalized_fields = _stringify_fields(fields_raw)
-                entry_copy = dict(entry)
-                entry_copy["fields"] = normalized_fields
-                entry_copy["id"] = entry.get("id") or normalized_fields.get("id")
-
-                start_dt = _parse_iso_date(normalized_fields.get("start date"))
-                if start_dt is None:
-                    continue
-                if start_date and start_dt < start_date:
-                    continue
-                if end_date and start_dt > end_date:
-                    continue
-
-                events.append(entry_copy)
+                normalized = _normalize_timeoff_entry(
+                    entry,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                if normalized:
+                    events.append(normalized)
 
             next_token = payload.get("next")
             if not next_token:
                 break
             offset = str(next_token)
         return events
+    finally:
+        session.close()
+
+
+def ch_get_timeoff(timeoff_id: str) -> Optional[Dict]:
+    timeoff_id = (timeoff_id or "").strip()
+    if not timeoff_id:
+        return None
+    session = _new_session()
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/timeoff/{timeoff_id}"
+        payload = _get_json(session, url, params={"include": "person"})
+        entry = payload.get("data") or payload
+        if not isinstance(entry, dict):
+            return None
+        return _normalize_timeoff_entry(entry)
     finally:
         session.close()
