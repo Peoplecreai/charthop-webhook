@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.clients.charthop import (
     ch_fetch_timeoff_enriched,
@@ -10,28 +10,88 @@ from app.clients.charthop import (
     ch_people_starting_between,
     ch_person_primary_email,
 )
-from app.clients.runn import runn_create_leave, runn_find_person_by_email, runn_upsert_person
+from app.clients.runn import (
+    runn_create_timeoff,
+    runn_find_person_by_email,
+    runn_upsert_person,
+)
 from app.utils.config import (
     RUNN_ONBOARDING_LOOKAHEAD_DAYS,
     RUNN_TIMEOFF_LOOKAHEAD_DAYS,
     RUNN_TIMEOFF_LOOKBACK_DAYS,
 )
 
-
 logger = logging.getLogger(__name__)
 
+# -------------------------
+# Utilidades
+# -------------------------
 
 def _safe_date(value: str) -> str:
     if not value:
         return ""
+    # Normaliza a "YYYY-MM-DD"
     return value[:10]
 
+def _parse_hours_per_day(entry: Dict[str, Any]) -> float:
+    fields = entry.get("fields") or {}
+    # intenta varios nombres que suelen aparecer en ChartHop
+    cand = (
+        entry.get("hoursPerDay")
+        or fields.get("hours per day")
+        or fields.get("hours/day")
+        or fields.get("hours_per_day")
+    )
+    try:
+        return float(cand) if cand is not None else 8.0
+    except Exception:
+        return 8.0
 
-def sync_runn_onboarding(reference: dt.date | None = None) -> Dict:
+def _timeoff_category(entry: Dict[str, Any]) -> str:
+    """
+    Decide la categoría en Runn:
+      - "holidays" si parece feriado/holiday
+      - "rostered-off" si menciona roster/rostered/floating
+      - por defecto "leave"
+    """
+    fields = entry.get("fields") or {}
+    text = " ".join(
+        str(x or "")
+        for x in [
+            fields.get("type"),
+            fields.get("reason"),
+            entry.get("type"),
+            entry.get("reason"),
+            fields.get("policy"),
+        ]
+    ).lower()
+
+    if "holiday" in text or "feriado" in text:
+        return "holidays"
+    if "roster" in text or "rostered" in text or "floating" in text:
+        return "rostered-off"
+    return "leave"
+
+def _timeoff_reason(entry: Dict[str, Any]) -> str:
+    fields = entry.get("fields") or {}
+    raw_reason = (fields.get("reason") or entry.get("reason") or "").strip()
+    raw_type = (fields.get("type") or entry.get("type") or "").strip()
+    policy = (fields.get("policy") or "").strip()
+    # pref: reason > type > policy
+    for s in (raw_reason, raw_type, policy):
+        if s:
+            return s
+    return "Leave"
+
+# -------------------------
+# Onboarding (sin cambios funcionales)
+# -------------------------
+
+def sync_runn_onboarding(reference: dt.date | None = None) -> Dict[str, Any]:
     reference = reference or dt.date.today()
     end = reference + dt.timedelta(days=RUNN_ONBOARDING_LOOKAHEAD_DAYS)
     people = ch_people_starting_between(reference, end)
-    results: List[Dict] = []
+    results: List[Dict[str, Any]] = []
     for person in people:
         fields = person.get("fields") or {}
         name = " ".join(
@@ -53,66 +113,72 @@ def sync_runn_onboarding(reference: dt.date | None = None) -> Dict:
         results.append({"person": name or email, "status": "created" if runn_resp else "error", "response": runn_resp})
     return {"processed": len(people), "results": results}
 
+# -------------------------
+# Time off (v1)
+# -------------------------
 
-def _timeoff_reason(entry: Dict) -> str:
+def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Toma un registro de ChartHop y crea el time-off en Runn v1 (idempotencia básica por note).
+    """
     fields = entry.get("fields") or {}
-    raw_reason = (fields.get("reason") or entry.get("reason") or "").lower()
-    raw_type = (fields.get("type") or entry.get("type") or "").lower()
-    text = raw_reason or raw_type
-    if "sick" in text:
-        return "Sick leave"
-    if "pto" in text or "vacation" in text:
-        return "Vacation"
-    if "bereavement" in text:
-        return "Bereavement"
-    return "Leave"
 
-
-def _sync_timeoff_entry(entry: Dict) -> Dict:
-    fields = entry.get("fields") or {}
+    # 1) Email
     email = (entry.get("personEmail") or "").strip()
     if not email:
         email = (fields.get("person contact workemail") or fields.get("contact workemail") or "").strip()
     if not email:
         email = (fields.get("person contact personalemail") or "").strip()
     if not email:
-        logger.warning(
-            "Timeoff skipped: missing email",
-            extra={"timeoffId": entry.get("id"), "personId": entry.get("personId")},
-        )
-        result = {
-            "status": "skipped",
-            "reason": "missing email",
-            "entry": entry,
-        }
-        return result
+        logger.warning("Timeoff skipped: missing email",
+                       extra={"timeoffId": entry.get("id"), "personId": entry.get("personId")})
+        return {"status": "skipped", "reason": "missing email", "entry": entry}
+
     person = runn_find_person_by_email(email)
     if not person or not person.get("id"):
         return {"status": "skipped", "reason": "person not found", "email": email}
+
+    # 2) Fechas
     start_date = _safe_date(fields.get("start date") or entry.get("startDate") or "")
     end_date = _safe_date(fields.get("end date") or entry.get("endDate") or start_date)
     if not start_date:
         return {"status": "skipped", "reason": "missing start date", "email": email}
+
+    # 3) Duración por día
+    hours_per_day = _parse_hours_per_day(entry)  # default 8.0
+    minutes_per_day = int(round(hours_per_day * 60))
+
+    # 4) Categoría y nota
+    category = _timeoff_category(entry)  # "leave" | "holidays" | "rostered-off"
     reason = _timeoff_reason(entry)
-    resp = runn_create_leave(
-        person_id=person["id"],
-        starts_at=start_date,
-        ends_at=end_date or start_date,
-        reason=reason,
-        external_ref=str(entry.get("id") or fields.get("id") or ""),
+    ext_id = str(entry.get("id") or fields.get("id") or "")
+    note = f"CHP:{ext_id} • {reason}" if ext_id or reason else None
+
+    # 5) Create en Runn (v1)
+    ok = runn_create_timeoff(
+        person_id=int(person["id"]),
+        start_date=start_date,
+        end_date=end_date or start_date,
+        minutes_per_day=minutes_per_day,
+        note=note,
+        category=category,
     )
-    return {"status": "synced" if resp else "error", "email": email, "response": resp}
+    return {"status": "synced" if ok else "error", "email": email, "category": category, "minutesPerDay": minutes_per_day}
 
-
-def sync_runn_timeoff(reference: dt.date | None = None) -> Dict:
+def sync_runn_timeoff(reference: dt.date | None = None) -> Dict[str, Any]:
+    """
+    Trae time-off de ChartHop y los inserta en Runn v1.
+    Ventana: [reference - LOOKBACK, reference + LOOKAHEAD]
+    """
     reference = reference or dt.date.today()
     start = reference - dt.timedelta(days=RUNN_TIMEOFF_LOOKBACK_DAYS)
     end = reference + dt.timedelta(days=RUNN_TIMEOFF_LOOKAHEAD_DAYS)
+
     events = ch_fetch_timeoff_enriched(start.isoformat(), end.isoformat())
-    results: List[Dict] = []
+    results: List[Dict[str, Any]] = []
     for entry in events:
-        result = _sync_timeoff_entry(entry)
-        results.append(result)
+        results.append(_sync_timeoff_entry(entry))
+
     summary = {
         "processed": len(events),
         "synced": sum(1 for item in results if item.get("status") == "synced"),
@@ -131,8 +197,10 @@ def sync_runn_timeoff(reference: dt.date | None = None) -> Dict:
     )
     return summary
 
-
-def sync_runn_timeoff_event(timeoff_id: str) -> Dict:
+def sync_runn_timeoff_event(timeoff_id: str) -> Dict[str, Any]:
+    """
+    Para llamadas puntuales (webhook) por ID de ChartHop.
+    """
     entry = ch_get_timeoff(timeoff_id)
     if not entry:
         return {"status": "error", "reason": "timeoff not found", "timeoff_id": timeoff_id}
