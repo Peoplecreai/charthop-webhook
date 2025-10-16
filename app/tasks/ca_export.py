@@ -1,31 +1,15 @@
 from __future__ import annotations
 
-import json
 import os
 import time
-from importlib import import_module
 from typing import Optional
 
 from flask import Blueprint, jsonify
 
 from app.services.culture_amp import export_culture_amp_snapshot
+from app.tasks.cloud import enqueue_http_task
 
 bp_tasks = Blueprint("tasks", __name__)
-
-_tasks_module = None
-
-def _require_tasks_module():
-    global _tasks_module
-    if _tasks_module is not None:
-        return _tasks_module
-    try:
-        module = import_module("google.cloud.tasks_v2")
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "google-cloud-tasks no está instalado. Agrega 'google-cloud-tasks' a tus dependencias."
-        ) from exc
-    _tasks_module = module
-    return module
 
 
 def _load_cfg() -> dict:
@@ -55,29 +39,17 @@ def _load_cfg() -> dict:
 
 
 def enqueue_export_task(payload: Optional[dict] = None) -> dict:
-    tasks_v2 = _require_tasks_module()
     cfg = _load_cfg()
-    client = tasks_v2.CloudTasksClient()
-    parent = client.queue_path(cfg["project"], cfg["location"], cfg["queue"])
-
-    url = f"{cfg['run_service_url'].rstrip('/')}/tasks/export-culture-amp"
-    body_bytes = json.dumps(payload or {}).encode("utf-8")
-
-    task = {
-        "http_request": {
-            "http_method": tasks_v2.HttpMethod.POST,
-            "url": url,
-            "headers": {"Content-Type": "application/json"},
-            "body": body_bytes,
-            "oidc_token": {
-                "service_account_email": cfg["service_account_email"],
-                "audience": cfg["run_service_url"],
-            },
-        }
-    }
-
-    created = client.create_task(request={"parent": parent, "task": task})
-    return {"name": created.name, "url": url}
+    return enqueue_http_task(
+        queue=cfg["queue"],
+        relative_url="/tasks/export-culture-amp",
+        payload=payload,
+        project=cfg["project"],
+        location=cfg["location"],
+        service_url=cfg["run_service_url"],
+        service_account_email=cfg["service_account_email"],
+        audience=cfg["run_service_url"],
+    )
 
 
 @bp_tasks.post("/tasks/export-culture-amp")

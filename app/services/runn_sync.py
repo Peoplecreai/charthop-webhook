@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from app.clients.charthop import (
     ch_fetch_timeoff_enriched,
     ch_get_timeoff,
+    ch_get_person,
     ch_people_starting_between,
     ch_person_primary_email,
 )
@@ -112,6 +113,70 @@ def sync_runn_onboarding(reference: dt.date | None = None) -> Dict[str, Any]:
         )
         results.append({"person": name or email, "status": "created" if runn_resp else "error", "response": runn_resp})
     return {"processed": len(people), "results": results}
+
+
+def sync_runn_onboarding_event(person_id: str) -> Dict[str, Any]:
+    """Procesa un evento puntual de persona (create/update) desde ChartHop."""
+
+    person_id = (person_id or "").strip()
+    if not person_id:
+        return {"status": "error", "reason": "missing person_id"}
+
+    person = ch_get_person(person_id)
+    if not person:
+        return {"status": "error", "reason": "person not found", "person_id": person_id}
+
+    fields = person.get("fields") if isinstance(person.get("fields"), dict) else {}
+    email = ch_person_primary_email(person)
+    if not email:
+        return {"status": "skipped", "reason": "missing email", "person_id": person_id}
+
+    name_parts = [
+        (fields.get("name") or "").strip(),
+        " ".join(
+            part.strip()
+            for part in [fields.get("name first") or "", fields.get("name last") or ""]
+            if part
+        ).strip(),
+        (person.get("name") or "").strip(),
+    ]
+    name = next((part for part in name_parts if part), email)
+
+    employment_type = (
+        (fields.get("employment type") or "").strip()
+        or (fields.get("employmenttype") or "").strip()
+        or (person.get("employmentType") or "").strip()
+        or "employee"
+    )
+
+    start_candidate = (
+        fields.get("start date")
+        or fields.get("startdate")
+        or fields.get("start date org")
+        or person.get("startDateOrg")
+        or ""
+    )
+    starts_at = _safe_date(start_candidate)
+
+    runn_resp = runn_upsert_person(
+        name=name,
+        email=email,
+        employment_type=employment_type or "employee",
+        starts_at=starts_at or None,
+    )
+
+    result: Dict[str, Any] = {
+        "status": "synced" if runn_resp else "error",
+        "person_id": person_id,
+        "email": email,
+        "employment_type": employment_type or "employee",
+        "name": name,
+    }
+    if starts_at:
+        result["starts_at"] = starts_at
+    if runn_resp is not None:
+        result["runn_response"] = runn_resp
+    return result
 
 # -------------------------
 # Time off (v1)

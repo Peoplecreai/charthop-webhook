@@ -1,6 +1,7 @@
 from flask import Blueprint, request
+
 from app.services.job_sync import sync_job_create, sync_job_update
-from app.services.runn_sync import sync_runn_timeoff_event
+from app.tasks.charthop_dispatcher import enqueue_charthop_task
 
 bp_ch = Blueprint("charthop_webhook", __name__)
 
@@ -10,19 +11,40 @@ def ch_webhook():
         return "ChartHop webhook up", 200
 
     evt = request.get_json(force=True, silent=True) or {}
-    evtype = (evt.get("type") or evt.get("eventType") or evt.get("event_type") or "").lower()
+    evtype_raw = (evt.get("type") or evt.get("eventType") or evt.get("event_type") or "").lower()
+    evtype = evtype_raw.replace("-", ".")
     entity = (evt.get("entityType") or evt.get("entitytype") or evt.get("entity_type") or "").lower()
     entity_id = str(evt.get("entityId") or evt.get("entityid") or evt.get("entity_id") or "")
 
-    print(f"CH evt: type={evtype} entity={entity} entity_id={entity_id}")
+    type_parts = [part for part in evtype.split(".") if part]
+    type_entity = type_parts[0] if len(type_parts) >= 2 else ""
+    action = type_parts[-1] if type_parts else evtype
+    if not entity and type_entity:
+        entity = type_entity
+
+    print(f"CH evt: type={evtype_raw} entity={entity} entity_id={entity_id}")
     is_job = entity in ("job", "jobs")
-    is_timeoff = entity in ("timeoff", "time off", "time-off")
-    is_create = evtype in ("job.create", "job_create", "create")
-    is_update = evtype in ("job.update", "job_update", "update", "change")
+    is_timeoff = entity in ("timeoff", "time off", "time-off") or type_entity == "timeoff"
+    is_person = entity in ("person", "people") or type_entity == "person"
+    is_create = action in ("create", "created")
+    is_update = action in ("update", "updated", "change", "changed")
 
     if is_timeoff and entity_id:
-        result = sync_runn_timeoff_event(entity_id)
-        print(f"CH timeoff sync result: {result}")
+        try:
+            task = enqueue_charthop_task("timeoff", entity_id)
+            print(f"Queued ChartHop timeoff task: {task}")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"Failed to enqueue timeoff task: {exc}")
+            return "", 500
+        return "", 200
+
+    if is_person and entity_id and (is_create or is_update):
+        try:
+            task = enqueue_charthop_task("person", entity_id)
+            print(f"Queued ChartHop person task: {task}")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"Failed to enqueue person task: {exc}")
+            return "", 500
         return "", 200
 
     if not is_job:
