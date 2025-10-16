@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import hashlib
+import os
 import time
 import datetime as dt
 from collections import OrderedDict
@@ -66,6 +67,40 @@ def _get_json(session: Session, url: str, params: Dict[str, str], max_retries: i
         if attempt > max_retries:
             raise RuntimeError(f"ChartHop request failed after retries: {last_exc}") from last_exc
         time.sleep(min(2 ** (attempt - 1), 30))
+
+
+def ch_get_paginated(url: str, params: Dict[str, object]) -> List[Dict]:
+    session = _new_session()
+    results: List[Dict] = []
+    offset: Optional[str] = None
+    try:
+        while True:
+            query: Dict[str, object] = {}
+            for key, value in params.items():
+                if value is None:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    query[str(key)] = value
+                else:
+                    query[str(key)] = str(value)
+            if offset:
+                query["offset"] = offset
+            payload = _get_json(session, url, query)
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if data is None:
+                data = payload
+            if isinstance(data, dict):
+                data = [data]
+            if not data:
+                break
+            results.extend(data)
+            next_token = payload.get("next") if isinstance(payload, dict) else None
+            if not next_token:
+                break
+            offset = str(next_token)
+    finally:
+        session.close()
+    return results
 
 
 # =========================
@@ -711,6 +746,52 @@ def _normalize_timeoff_entry(
     return entry_copy
 
 
+def ch_fetch_timeoff_basic(start: str, end: str) -> List[Dict]:
+    """GET /v1/org/{orgId}/timeoff con paginación, sin include."""
+    url = f"{os.environ['CH_API']}/v1/org/{os.environ['CH_ORG_ID']}/timeoff"
+    params: Dict[str, object] = {"limit": 200}
+    if start:
+        params["startDate[gte]"] = start
+    if end:
+        params["startDate[lte]"] = end
+    return ch_get_paginated(url, params)
+
+
+def _extract_email(person: Dict) -> Optional[str]:
+    # prioriza WORK_EMAIL, luego HOME_EMAIL, luego fallback legacy .contact
+    for t in ("WORK_EMAIL", "HOME_EMAIL"):
+        for c in person.get("contacts", []) or []:
+            if c.get("type") == t and c.get("value"):
+                return c["value"]
+    contact = person.get("contact") or {}
+    return contact.get("workemail") or contact.get("personalemail")
+
+
+def ch_fetch_people_by_ids(ids: List[str]) -> Dict[str, Dict]:
+    """Devuelve map personId -> {email, name, title} haciendo batch de 100 ids."""
+    if not ids:
+        return {}
+    all_people: List[Dict] = []
+    for i in range(0, len(ids), 100):
+        batch = [str(pid) for pid in ids[i : i + 100] if pid]
+        if not batch:
+            continue
+        chunk = ",".join(batch)
+        url = f"{os.environ['CH_API']}/v1/org/{os.environ['CH_ORG_ID']}/person"
+        params = {"ids": chunk, "include": "contact"}
+        all_people += ch_get_paginated(url, params)
+    pmap: Dict[str, Dict] = {}
+    for person in all_people:
+        email = _extract_email(person)
+        if email:
+            pmap[person.get("id")] = {
+                "email": email,
+                "name": person.get("name"),
+                "title": person.get("title"),
+            }
+    return pmap
+
+
 def ch_fetch_timeoff(
     start: Optional[dt.date | dt.datetime], end: Optional[dt.date | dt.datetime]
 ) -> List[Dict]:
@@ -758,6 +839,33 @@ def ch_fetch_timeoff(
         return events
     finally:
         session.close()
+
+
+def ch_fetch_timeoff_enriched(start: str, end: str) -> List[Dict]:
+    """Trae timeoff y enriquece cada item con personEmail/personName/personTitle."""
+    items = ch_fetch_timeoff_basic(start, end)
+    ids = sorted({it.get("personId") for it in items if it.get("personId")})
+    pmap = ch_fetch_people_by_ids(ids)
+    start_dt = _parse_iso_date(start)
+    end_dt = _parse_iso_date(end)
+    enriched: List[Dict] = []
+    for raw in items:
+        entry = dict(raw)
+        person = pmap.get(entry.get("personId"))
+        if person:
+            entry["personEmail"] = person["email"]
+            entry["personName"] = person.get("name")
+            entry["personTitle"] = person.get("title")
+        normalized = _normalize_timeoff_entry(entry, start_date=start_dt, end_date=end_dt)
+        if normalized:
+            if person:
+                normalized.setdefault("personEmail", person["email"])
+                if person.get("name"):
+                    normalized.setdefault("personName", person["name"])
+                if person.get("title"):
+                    normalized.setdefault("personTitle", person["title"])
+            enriched.append(normalized)
+    return enriched
 
 
 def ch_get_timeoff(timeoff_id: str) -> Optional[Dict]:
