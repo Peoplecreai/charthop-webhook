@@ -797,7 +797,7 @@ def ch_fetch_timeoff(
 ) -> List[Dict]:
     start_date = _normalize_date_arg(start)
     end_date = _normalize_date_arg(end)
-    url = f"{CH_API}/v2/org/{CH_ORG_ID}/timeoff"
+    url = f"{CH_API}/v1/org/{CH_ORG_ID}/timeoff"
     limit = CH_PEOPLE_PAGE_SIZE or 200
     base_params = {
         "limit": str(limit),
@@ -874,7 +874,7 @@ def ch_get_timeoff(timeoff_id: str) -> Optional[Dict]:
         return None
     session = _new_session()
     try:
-        url = f"{CH_API}/v2/org/{CH_ORG_ID}/timeoff/{timeoff_id}"
+        url = f"{CH_API}/v1/org/{CH_ORG_ID}/timeoff/{timeoff_id}"
         payload = _get_json(session, url, params={"include": "person"})
         entry = payload.get("data") or payload
         if not isinstance(entry, dict):
