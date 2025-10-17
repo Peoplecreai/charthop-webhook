@@ -664,7 +664,7 @@ def ch_get_person(person_id: str) -> Optional[Dict]:
     session = _new_session()
     try:
         url = f"{CH_API}/v2/org/{CH_ORG_ID}/person/{person_id}"
-        payload = _get_json(session, url, {"include": "fields,contacts"})
+        payload = _get_json(session, url, {"include": "contacts,contact,fields"})
         entity = _extract_entity(payload)
         if not entity:
             return None
