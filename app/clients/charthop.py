@@ -665,19 +665,19 @@ def ch_get_person(person_id: str) -> Optional[Dict]:
     try:
         url = f"{CH_API}/v2/org/{CH_ORG_ID}/person/{person_id}"
         payload = _get_json(session, url, {"include": "contacts,contact,fields"})
-         entity = _extract_entity(payload)
-         if not entity:
-             return None
-         fields = entity.get("fields")
-         if isinstance(fields, dict):
-             entity["fields"] = _stringify_fields(fields)
-         return entity
-     except HTTPError as exc:
-         if exc.response is not None and exc.response.status_code == 404:
-             return None
-         raise
-     finally:
-         session.close()
+        entity = _extract_entity(payload)
+        if not entity:
+            return None
+        fields = entity.get("fields")
+        if isinstance(fields, dict):
+            entity["fields"] = _stringify_fields(fields)
+        return entity
+    except HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            return None
+        raise
+    finally:
+        session.close()
 
 def ch_person_primary_email(person: Dict) -> str:
     if not isinstance(person, dict):
