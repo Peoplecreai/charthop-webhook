@@ -7,10 +7,11 @@ from typing import Any, Dict, List, Optional
 from app.clients.charthop import (
     ch_fetch_timeoff_enriched,
     ch_get_timeoff,
-    ch_get_person,
+    ch_get_person,               # v2
     ch_people_starting_between,
     ch_person_primary_email,
-    _person_email,
+    _person_email,               # helper para v2
+    ch_fetch_people_by_ids,      # <-- v1: include=contact,contacts (fallback robusto)
 )
 from app.clients.runn import (
     runn_create_timeoff,
@@ -189,12 +190,14 @@ def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     """
     fields = entry.get("fields") or {}
 
-    # 1) Email
+    # 1) Email (directo del evento)
     email = (entry.get("personEmail") or "").strip()
     if not email:
         email = (fields.get("person contact workemail") or fields.get("contact workemail") or "").strip()
     if not email:
         email = (fields.get("person contact personalemail") or "").strip()
+
+    # 1b) Fallback por personId usando v1 person (contacts + contact)
     if not email:
         person_id = str(
             entry.get("personId")
@@ -202,18 +205,37 @@ def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
             or ""
         ).strip()
         if person_id:
-            person = ch_get_person(person_id)
-            if person:
-                email = _person_email(person) or ""
-                if email:
+            # v1: include=contact,contacts – más confiable para emails
+            pmap = ch_fetch_people_by_ids([person_id])
+            pdata = pmap.get(person_id) or {}
+            candidate = (pdata.get("email") or "").strip()
+            if candidate:
+                email = candidate
+                entry = dict(entry)
+                entry.setdefault("personEmail", email)
+
+    # 1c) Fallback adicional con v2 get person (por si en algún caso v1 no trae nada)
+    if not email:
+        person_id = str(
+            entry.get("personId")
+            or (entry.get("person") or {}).get("id")
+            or ""
+        ).strip()
+        if person_id:
+            person_v2 = ch_get_person(person_id)  # incluye fields,contacts
+            if person_v2:
+                candidate = _person_email(person_v2) or ""
+                if candidate:
+                    email = candidate
                     entry = dict(entry)
                     entry.setdefault("personEmail", email)
-        if not email:
-            logger.warning(
-                "Timeoff skipped: missing email",
-                extra={"timeoffId": entry.get("id"), "personId": entry.get("personId")},
-            )
-            return {"status": "skipped", "reason": "missing email", "entry": entry}
+
+    if not email:
+        logger.warning(
+            "Timeoff skipped: missing email",
+            extra={"timeoffId": entry.get("id"), "personId": entry.get("personId")},
+        )
+        return {"status": "skipped", "reason": "missing email", "entry": entry}
 
     person = runn_find_person_by_email(email)
     if not person or not person.get("id"):
@@ -229,7 +251,7 @@ def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     hours_per_day = _parse_hours_per_day(entry)  # default 8.0
     minutes_per_day = int(round(hours_per_day * 60))
 
-    # 4) Categoría y nota
+    # 4) Categoría y nota (idempotencia por note con ref externa)
     category = _timeoff_category(entry)  # "leave" | "holidays" | "rostered-off"
     reason = _timeoff_reason(entry)
     ext_id = str(entry.get("id") or fields.get("id") or "")
@@ -244,7 +266,16 @@ def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         note=note,
         category=category,
     )
-    return {"status": "synced" if ok else "error", "email": email, "category": category, "minutesPerDay": minutes_per_day}
+    return {
+        "status": "synced" if ok else "error",
+        "email": email,
+        "category": category,
+        "minutesPerDay": minutes_per_day,
+        "runn_person_id": person.get("id"),
+        "start_date": start_date,
+        "end_date": end_date or start_date,
+        "ext_ref": ext_id,
+    }
 
 def sync_runn_timeoff(reference: dt.date | None = None) -> Dict[str, Any]:
     """
