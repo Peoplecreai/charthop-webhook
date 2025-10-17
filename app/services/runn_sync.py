@@ -10,6 +10,7 @@ from app.clients.charthop import (
     ch_get_person,
     ch_people_starting_between,
     ch_person_primary_email,
+    _person_email,
 )
 from app.clients.runn import (
     runn_create_timeoff,
@@ -195,9 +196,24 @@ def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     if not email:
         email = (fields.get("person contact personalemail") or "").strip()
     if not email:
-        logger.warning("Timeoff skipped: missing email",
-                       extra={"timeoffId": entry.get("id"), "personId": entry.get("personId")})
-        return {"status": "skipped", "reason": "missing email", "entry": entry}
+        person_id = str(
+            entry.get("personId")
+            or (entry.get("person") or {}).get("id")
+            or ""
+        ).strip()
+        if person_id:
+            person = ch_get_person(person_id)
+            if person:
+                email = _person_email(person) or ""
+                if email:
+                    entry = dict(entry)
+                    entry.setdefault("personEmail", email)
+        if not email:
+            logger.warning(
+                "Timeoff skipped: missing email",
+                extra={"timeoffId": entry.get("id"), "personId": entry.get("personId")},
+            )
+            return {"status": "skipped", "reason": "missing email", "entry": entry}
 
     person = runn_find_person_by_email(email)
     if not person or not person.get("id"):
