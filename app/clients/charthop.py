@@ -664,7 +664,7 @@ def ch_get_person(person_id: str) -> Optional[Dict]:
     session = _new_session()
     try:
         url = f"{CH_API}/v2/org/{CH_ORG_ID}/person/{person_id}"
-        payload = _get_json(session, url, {"include": "fields"})
+        payload = _get_json(session, url, {"include": "fields,contacts"})
         entity = _extract_entity(payload)
         if not entity:
             return None
@@ -747,11 +747,16 @@ def _normalize_timeoff_entry(
             (person_fields.get("contact personalemail") if isinstance(person_fields, dict) else None)
             or contact.get("personalEmail")
         )
+        modern_email = _person_email(person_info)
+        if modern_email and modern_email != work_email:
+            work_email = work_email or modern_email
         if work_email:
             fields_raw.setdefault("person contact workemail", work_email)
             fields_raw.setdefault("contact workemail", work_email)
         if personal_email:
             fields_raw.setdefault("person contact personalemail", personal_email)
+        elif modern_email:
+            fields_raw.setdefault("person contact personalemail", modern_email)
 
     normalized_fields = _stringify_fields(fields_raw)
     entry_copy = dict(entry)
@@ -780,14 +785,25 @@ def ch_fetch_timeoff_basic(start: str, end: str) -> List[Dict]:
     return ch_get_paginated(url, params)
 
 
-def _extract_email(person: Dict) -> Optional[str]:
-    # prioriza WORK_EMAIL, luego HOME_EMAIL, luego fallback legacy .contact
-    for t in ("WORK_EMAIL", "HOME_EMAIL"):
-        for c in person.get("contacts", []) or []:
-            if c.get("type") == t and c.get("value"):
-                return c["value"]
-    contact = person.get("contact") or {}
-    return contact.get("workemail") or contact.get("personalemail")
+def _person_email(person: Dict) -> Optional[str]:
+    """
+    Prioriza WORK_EMAIL luego HOME_EMAIL en person.contacts,
+    y si no existe, hace fallback a legacy person.contact.{workemail,personalemail}.
+    """
+    # Nuevo: contacts (API moderna)
+    for typ in ("WORK_EMAIL", "HOME_EMAIL"):
+        for contact in person.get("contacts", []) or []:
+            if contact.get("type") == typ and contact.get("value"):
+                return contact["value"]
+
+    # Legacy: contact.*
+    legacy_contact = person.get("contact") or {}
+    for key in ("workemail", "personalemail"):
+        value = legacy_contact.get(key)
+        if value:
+            return value
+
+    return None
 
 
 def ch_fetch_people_by_ids(ids: List[str]) -> Dict[str, Dict]:
@@ -801,11 +817,11 @@ def ch_fetch_people_by_ids(ids: List[str]) -> Dict[str, Dict]:
             continue
         chunk = ",".join(batch)
         url = f"{os.environ['CH_API']}/v1/org/{os.environ['CH_ORG_ID']}/person"
-        params = {"ids": chunk, "include": "contact"}
+        params = {"ids": chunk, "include": "contact,contacts"}
         all_people += ch_get_paginated(url, params)
     pmap: Dict[str, Dict] = {}
     for person in all_people:
-        email = _extract_email(person)
+        email = _person_email(person)
         if email:
             pmap[person.get("id")] = {
                 "email": email,
