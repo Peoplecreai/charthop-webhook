@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from app.utils.rate_limiter import DictCache, RateLimiter
+from app.utils.rate_limiter import RateLimiter, TimedCache
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,20 @@ _ROLES_CACHE: Optional[List[Dict[str, Any]]] = None
 _RATE_LIMITER = RateLimiter(max_requests=100, window_seconds=60)
 
 # Cache de personas: 5 minutos de TTL
-_PEOPLE_CACHE = DictCache(ttl_seconds=300)
+_PEOPLE_CACHE = TimedCache(ttl_seconds=300)
+
+
+def _extract_people_list(data: Any) -> List[Dict[str, Any]]:
+    """Normaliza la respuesta del endpoint /people."""
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+
+    if isinstance(data, dict):
+        values = data.get("values")
+        if isinstance(values, list):
+            return [item for item in values if isinstance(item, dict)]
+
+    return []
 
 
 def _runn_headers() -> Dict[str, str]:
@@ -33,17 +46,31 @@ def _runn_headers() -> Dict[str, str]:
 
 
 def runn_get_people() -> List[Dict[str, Any]]:
-    """
-    GET /people (v1.0)
-    Con rate limiting.
-    """
-    _RATE_LIMITER.wait_if_needed()
-    url = f"{RUNN_BASE_URL}/people"
+    """Obtiene todas las personas de Runn utilizando paginación."""
+    url = f"{RUNN_BASE_URL}/people/"
     headers = _runn_headers()
-    resp = requests.get(url, headers=headers, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    return data if isinstance(data, list) else []
+    people: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+
+    while True:
+        _RATE_LIMITER.wait_if_needed()
+        params = {"cursor": cursor} if cursor else None
+
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+
+        people.extend(_extract_people_list(data))
+
+        if isinstance(data, dict):
+            cursor = data.get("nextCursor") or data.get("next_cursor")
+        else:
+            cursor = None
+
+        if not cursor:
+            break
+
+    return people
 
 
 def runn_find_person_by_email(email: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
@@ -64,29 +91,57 @@ def runn_find_person_by_email(email: str, use_cache: bool = True) -> Optional[Di
 
     # Intentar del caché primero
     if use_cache:
-        # Si el caché está expirado, recargarlo
-        if _PEOPLE_CACHE.is_expired():
-            _PEOPLE_CACHE.load(
-                loader_fn=runn_get_people,
-                key_fn=lambda p: (p.get("email") or "").strip().lower()
-            )
-
-        # Buscar en el caché
         cached_person = _PEOPLE_CACHE.get(email_low)
         if cached_person is not None:
             return cached_person
 
-        # No está en caché, pero el caché está cargado
-        # Esto significa que la persona no existe
+    person = _fetch_person_by_email(email.strip())
+    if person:
+        if use_cache:
+            _PEOPLE_CACHE.set(email_low, person)
+        return person
+
+    if not use_cache:
         return None
 
-    # Sin caché: búsqueda directa
-    for p in runn_get_people():
-        em = (p.get("email") or "").strip().lower()
-        if em and em == email_low:
-            return p
+    # Fallback: recargar todo el listado (puede ser costoso pero asegura consistencia)
+    try:
+        for p in runn_get_people():
+            em = (p.get("email") or "").strip().lower()
+            if em and em == email_low:
+                _PEOPLE_CACHE.set(email_low, p)
+                return p
+    except Exception:
+        logger.exception("Failed to refresh people cache from Runn")
 
     return None
+
+
+def _fetch_person_by_email(email: str) -> Optional[Dict[str, Any]]:
+    if not email:
+        return None
+
+    url = f"{RUNN_BASE_URL}/people/"
+    params = {"email": email}
+
+    try:
+        _RATE_LIMITER.wait_if_needed()
+        resp = requests.get(url, headers=_runn_headers(), params=params, timeout=60)
+        if not resp.ok:
+            logger.error(
+                "Failed to fetch person by email from Runn", extra={"email": email, "status": resp.status_code}
+            )
+            return None
+
+        for person in _extract_people_list(resp.json()):
+            em = (person.get("email") or "").strip().lower()
+            if em == email.strip().lower():
+                return person
+
+        return None
+    except Exception:
+        logger.exception("Exception fetching person by email from Runn", extra={"email": email})
+        return None
 
 
 def runn_get_roles() -> List[Dict[str, Any]]:
