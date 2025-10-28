@@ -15,11 +15,15 @@ from app.clients.charthop import (
 )
 from app.clients.runn import (
     runn_create_timeoff,
+    runn_delete_timeoff,
     runn_find_person_by_email,
+    runn_update_timeoff,
     runn_upsert_person,
     runn_get_existing_leave,
     runn_list_person_timeoffs,
 )
+from app.utils.timeoff_mapping import get_timeoff_mapping
+from app.utils.sync_metrics import get_sync_metrics
 from app.utils.config import (
     RUNN_ONBOARDING_LOOKAHEAD_DAYS,
     RUNN_TIMEOFF_LOOKAHEAD_DAYS,
@@ -32,10 +36,28 @@ logger = logging.getLogger(__name__)
 # Utilidades
 # -------------------------
 
-def _safe_date(value: str) -> str:
+def _safe_date(value: str) -> Optional[str]:
+    """
+    Valida y normaliza una fecha a formato YYYY-MM-DD.
+
+    Args:
+        value: Fecha en string (puede ser ISO 8601 completo)
+
+    Returns:
+        Fecha en formato YYYY-MM-DD o None si es inválida
+    """
     if not value:
-        return ""
-    return value[:10]
+        return None
+
+    date_str = value[:10]
+
+    # Validar formato YYYY-MM-DD
+    try:
+        dt.datetime.strptime(date_str, "%Y-%m-%d")
+        return date_str
+    except ValueError:
+        logger.warning(f"Invalid date format: {value}")
+        return None
 
 
 def _timeoff_category(entry: Dict[str, Any]) -> str:
@@ -72,11 +94,61 @@ def _timeoff_reason(entry: Dict[str, Any]) -> str:
     raw_reason = (fields.get("reason") or entry.get("reason") or "").strip()
     raw_type = (fields.get("type") or entry.get("type") or "").strip()
     policy = (fields.get("policy") or "").strip()
-    
+
     for s in (raw_reason, raw_type, policy):
         if s:
             return s
     return "Time Off"
+
+
+def _should_skip_timeoff(entry: Dict[str, Any]) -> Optional[str]:
+    """
+    Verifica si un time-off debe saltarse según su estado.
+
+    Args:
+        entry: Entrada de time-off de ChartHop
+
+    Returns:
+        Razón para saltarlo o None si debe procesarse
+    """
+    fields = entry.get("fields") or {}
+
+    # Verificar estado de aprobación
+    status = (
+        entry.get("status") or
+        fields.get("status") or
+        entry.get("state") or
+        fields.get("state") or
+        ""
+    ).lower()
+
+    # Estados que no deben sincronizarse
+    skip_statuses = {
+        "denied", "rejected", "cancelled", "canceled",
+        "draft", "pending", "withdrawn"
+    }
+
+    for skip_status in skip_statuses:
+        if skip_status in status:
+            return f"status is {status}"
+
+    # Verificar si está cancelado explícitamente
+    cancelled = (
+        entry.get("cancelled") or
+        entry.get("canceled") or
+        fields.get("cancelled") or
+        fields.get("canceled")
+    )
+
+    if cancelled is True or str(cancelled).lower() == "true":
+        return "time off is cancelled"
+
+    # Verificar si está activo (si el campo existe)
+    active = entry.get("active") or fields.get("active")
+    if active is False or str(active).lower() == "false":
+        return "time off is inactive"
+
+    return None
 
 
 # -------------------------
@@ -244,11 +316,25 @@ def _check_existing_timeoff(
 def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     """
     Sincroniza un registro de time-off de ChartHop a Runn v1.0.
-    
+
     IMPORTANTE: Runn v1.0 hace merge automático de periodos que se traslapan,
     así que no necesitamos preocuparnos tanto por duplicados exactos.
     """
     fields = entry.get("fields") or {}
+    ext_id = str(entry.get("id") or fields.get("id") or "")
+
+    # 0) Validar estado del time-off
+    skip_reason = _should_skip_timeoff(entry)
+    if skip_reason:
+        logger.info(
+            f"Timeoff skipped: {skip_reason}",
+            extra={"timeoffId": ext_id}
+        )
+        return {
+            "status": "skipped",
+            "reason": skip_reason,
+            "entry_id": ext_id
+        }
 
     # 1) Obtener email
     email = (entry.get("personEmail") or "").strip()
@@ -328,17 +414,49 @@ def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     # 4) Determinar categoría (leave, holidays, rostered-off)
     category = _timeoff_category(entry)
     reason = _timeoff_reason(entry)
-    ext_id = str(entry.get("id") or fields.get("id") or "")
     note = f"ChartHop:{ext_id} • {reason}" if ext_id or reason else None
 
-    # 5) Verificar si ya existe (para logging)
+    # 5) Verificar si ya existe un mapeo (para updates)
+    mapping = get_timeoff_mapping()
+    existing_mapping = mapping.get_runn_id(ext_id) if ext_id else None
+
+    if existing_mapping:
+        # Ya existe, actualizar en lugar de crear
+        runn_id = existing_mapping["runn_id"]
+        existing_category = existing_mapping["category"]
+
+        logger.info(
+            f"Time-off already mapped: ChartHop {ext_id} -> Runn {runn_id}, updating"
+        )
+
+        # Actualizar
+        updated = runn_update_timeoff(
+            timeoff_id=runn_id,
+            category=existing_category,
+            start_date=start_date,
+            end_date=end_date or start_date,
+            note=note,
+        )
+
+        return {
+            "status": "updated" if updated else "error",
+            "email": email,
+            "category": existing_category,
+            "runn_person_id": person.get("id"),
+            "runn_timeoff_id": runn_id,
+            "start_date": start_date,
+            "end_date": end_date or start_date,
+            "ext_ref": ext_id,
+        }
+
+    # 6) Verificar si ya existe otro time-off en las mismas fechas (para logging)
     existing = _check_existing_timeoff(
         person_id=int(person["id"]),
         start_date=start_date,
         end_date=end_date or start_date,
         category=category
     )
-    
+
     if existing:
         logger.info(
             f"Time-off overlaps with existing entry (Runn will merge automatically): "
@@ -346,9 +464,9 @@ def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         )
         # No retornamos, dejamos que Runn haga el merge
 
-    # 6) Crear en Runn v1.0
+    # 7) Crear en Runn v1.0
     # La API hace merge automático si hay overlap
-    success = runn_create_timeoff(
+    runn_response = runn_create_timeoff(
         person_id=int(person["id"]),
         start_date=start_date,
         end_date=end_date or start_date,
@@ -357,12 +475,24 @@ def _sync_timeoff_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         reason=reason,
     )
 
+    if runn_response:
+        # Guardar mapeo para futuras actualizaciones/eliminaciones
+        runn_id = runn_response.get("id")
+        if runn_id and ext_id:
+            mapping.add(
+                charthop_id=ext_id,
+                runn_id=runn_id,
+                category=category,
+                person_email=email
+            )
+
     return {
-        "status": "synced" if success else "error",
+        "status": "synced" if runn_response else "error",
         "email": email,
         "category": category,
         "endpoint": f"/time-offs/{category}",
         "runn_person_id": person.get("id"),
+        "runn_timeoff_id": runn_response.get("id") if runn_response else None,
         "start_date": start_date,
         "end_date": end_date or start_date,
         "ext_ref": ext_id,
@@ -375,36 +505,55 @@ def sync_runn_timeoff(reference: dt.date | None = None) -> Dict[str, Any]:
     Sincroniza time-off de ChartHop a Runn dentro de la ventana configurada.
     Usa la API v1.0 que hace merge automático de periodos overlapping.
     """
+    metrics = get_sync_metrics()
     reference = reference or dt.date.today()
     start = reference - dt.timedelta(days=RUNN_TIMEOFF_LOOKBACK_DAYS)
     end = reference + dt.timedelta(days=RUNN_TIMEOFF_LOOKAHEAD_DAYS)
 
     events = ch_fetch_timeoff_enriched(start.isoformat(), end.isoformat())
     results: List[Dict[str, Any]] = []
-    
+
     for entry in events:
         results.append(_sync_timeoff_entry(entry))
 
     summary = {
         "processed": len(events),
         "synced": sum(1 for r in results if r.get("status") == "synced"),
+        "updated": sum(1 for r in results if r.get("status") == "updated"),
         "skipped": sum(1 for r in results if r.get("status") == "skipped"),
         "error": sum(1 for r in results if r.get("status") == "error"),
         "auto_merged": sum(1 for r in results if r.get("auto_merged")),
         "results": results,
     }
-    
+
+    # Actualizar métricas
+    metrics.increment_counter("timeoff_synced", summary["synced"])
+    metrics.increment_counter("timeoff_updated", summary["updated"])
+    metrics.increment_counter("timeoff_skipped", summary["skipped"])
+    metrics.increment_counter("timeoff_errors", summary["error"])
+    metrics.record_sync("timeoff_batch")
+
+    # Registrar errores
+    for result in results:
+        if result.get("status") == "error":
+            metrics.record_error(
+                error_type="timeoff",
+                error_message=result.get("reason", "unknown error"),
+                entity_id=result.get("entry_id")
+            )
+
     logger.info(
         "Runn timeoff sync summary",
         extra={
             "processed": summary["processed"],
             "synced": summary["synced"],
+            "updated": summary["updated"],
             "skipped": summary["skipped"],
             "error": summary["error"],
             "auto_merged": summary["auto_merged"],
         }
     )
-    
+
     return summary
 
 
@@ -413,15 +562,112 @@ def sync_runn_timeoff_event(timeoff_id: str) -> Dict[str, Any]:
     Procesa un evento puntual de time-off desde webhook de ChartHop.
     Usa la API v1.0 de Runn con merge automático.
     """
+    metrics = get_sync_metrics()
+
     entry = ch_get_timeoff(timeoff_id)
     if not entry:
-        return {
+        error_result = {
             "status": "error",
             "reason": "timeoff not found",
             "timeoff_id": timeoff_id
         }
-    
+        metrics.increment_counter("timeoff_errors")
+        metrics.record_error(
+            error_type="timeoff",
+            error_message="timeoff not found",
+            entity_id=timeoff_id
+        )
+        return error_result
+
     result = _sync_timeoff_entry(entry)
     result.setdefault("timeoff_id", entry.get("id") or timeoff_id)
-    
+
+    # Actualizar métricas
+    status = result.get("status")
+    if status == "synced":
+        metrics.increment_counter("timeoff_synced")
+    elif status == "updated":
+        metrics.increment_counter("timeoff_updated")
+    elif status == "skipped":
+        metrics.increment_counter("timeoff_skipped")
+    elif status == "error":
+        metrics.increment_counter("timeoff_errors")
+        metrics.record_error(
+            error_type="timeoff",
+            error_message=result.get("reason", "unknown error"),
+            entity_id=timeoff_id
+        )
+
+    metrics.record_sync("timeoff_event")
+
     return result
+
+
+def delete_runn_timeoff_event(timeoff_id: str) -> Dict[str, Any]:
+    """
+    Elimina un time-off de Runn cuando se elimina en ChartHop.
+
+    Args:
+        timeoff_id: ID del time-off en ChartHop
+
+    Returns:
+        Resultado de la operación
+    """
+    metrics = get_sync_metrics()
+
+    timeoff_id = (timeoff_id or "").strip()
+    if not timeoff_id:
+        error_result = {"status": "error", "reason": "missing timeoff_id"}
+        metrics.increment_counter("timeoff_errors")
+        metrics.record_error(
+            error_type="timeoff_delete",
+            error_message="missing timeoff_id"
+        )
+        return error_result
+
+    # Buscar el mapeo
+    mapping = get_timeoff_mapping()
+    mapping_info = mapping.get_runn_id(timeoff_id)
+
+    if not mapping_info:
+        # No existe mapeo, probablemente nunca se sincronizó
+        logger.info(f"No mapping found for ChartHop timeoff {timeoff_id}, nothing to delete")
+        metrics.increment_counter("timeoff_skipped")
+        return {
+            "status": "skipped",
+            "reason": "no mapping found",
+            "timeoff_id": timeoff_id
+        }
+
+    runn_id = mapping_info["runn_id"]
+    category = mapping_info["category"]
+
+    # Eliminar en Runn
+    deleted = runn_delete_timeoff(runn_id, category)
+
+    if deleted:
+        # Eliminar el mapeo
+        mapping.remove(timeoff_id)
+
+        metrics.increment_counter("timeoff_deleted")
+        metrics.record_sync("timeoff_delete")
+
+        return {
+            "status": "deleted",
+            "timeoff_id": timeoff_id,
+            "runn_timeoff_id": runn_id,
+            "category": category
+        }
+    else:
+        metrics.increment_counter("timeoff_errors")
+        metrics.record_error(
+            error_type="timeoff_delete",
+            error_message="failed to delete from Runn",
+            entity_id=timeoff_id
+        )
+        return {
+            "status": "error",
+            "reason": "failed to delete from Runn",
+            "timeoff_id": timeoff_id,
+            "runn_timeoff_id": runn_id
+        }
