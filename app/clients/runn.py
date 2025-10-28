@@ -12,8 +12,8 @@ RUNN_BASE_URL = os.getenv("RUNN_BASE_URL", "https://api.runn.io")
 RUNN_ACCEPT_VERSION = os.getenv("RUNN_ACCEPT_VERSION", "1.0.0")
 RUNN_API_TOKEN = os.getenv("RUNN_API_TOKEN", "")
 
-# Cache para time-off types
-_TIME_OFF_TYPES_CACHE: Optional[List[Dict[str, Any]]] = None
+# Cache para roles
+_ROLES_CACHE: Optional[List[Dict[str, Any]]] = None
 
 
 def _runn_headers() -> Dict[str, str]:
@@ -26,7 +26,7 @@ def _runn_headers() -> Dict[str, str]:
 
 def runn_get_people() -> List[Dict[str, Any]]:
     """
-    GET /people (v1)
+    GET /people (v1.0)
     """
     url = f"{RUNN_BASE_URL}/people"
     headers = _runn_headers()
@@ -50,6 +50,49 @@ def runn_find_person_by_email(email: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def runn_get_roles() -> List[Dict[str, Any]]:
+    """
+    GET /roles
+    Obtiene la lista de roles disponibles.
+    Cachea el resultado.
+    """
+    global _ROLES_CACHE
+    
+    if _ROLES_CACHE is not None:
+        return _ROLES_CACHE
+    
+    url = f"{RUNN_BASE_URL}/roles"
+    try:
+        resp = requests.get(url, headers=_runn_headers(), timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        _ROLES_CACHE = data if isinstance(data, list) else []
+        return _ROLES_CACHE
+    except Exception as e:
+        logger.exception(f"Failed to fetch roles: {e}")
+        return []
+
+
+def runn_get_role_id_by_name(role_name: str) -> Optional[int]:
+    """
+    Obtiene el role_id dado un nombre de rol.
+    Roles comunes: "employee", "contractor", "placeholder"
+    """
+    roles = runn_get_roles()
+    role_lower = role_name.lower()
+    
+    for role in roles:
+        name = (role.get("name") or "").lower()
+        if name == role_lower:
+            return role.get("id")
+    
+    # Fallback: retornar el primer role_id disponible (usualmente "employee")
+    if roles:
+        return roles[0].get("id")
+    
+    return None
+
+
 def runn_upsert_person(
     name: str,
     email: str,
@@ -57,29 +100,41 @@ def runn_upsert_person(
     starts_at: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Crea o actualiza una persona en Runn.
+    Crea o actualiza una persona en Runn v1.0.
     POST /people
+    
+    IMPORTANTE: En v1.0, se usa role_id (no role_name).
+    La creación de persona también crea un contrato automáticamente.
     """
-    # Primero verifica si ya existe
+    # Verificar si ya existe
     existing = runn_find_person_by_email(email)
     if existing:
-        # Podrías implementar un PATCH aquí si necesitas actualizar
         logger.info(f"Person already exists in Runn: {email}")
         return existing
+    
+    # Obtener role_id
+    role_id = runn_get_role_id_by_name(employment_type)
+    if not role_id:
+        logger.error(f"Could not find role_id for employment_type: {employment_type}")
+        return None
     
     url = f"{RUNN_BASE_URL}/people"
     payload = {
         "name": name or email,
         "email": email,
-        "role": employment_type,  # 'employee', 'contractor', etc.
+        "roleId": role_id,  # v1.0 usa roleId, no role_name
     }
+    
+    # startsAt es opcional
     if starts_at:
         payload["startsAt"] = starts_at
     
     try:
         resp = requests.post(url, headers=_runn_headers(), json=payload, timeout=60)
         if resp.status_code in (200, 201):
+            logger.info(f"Person created in Runn: {email}")
             return resp.json()
+        
         logger.error(f"runn_upsert_person failed {resp.status_code}: {resp.text}")
         return None
     except Exception as e:
@@ -87,72 +142,60 @@ def runn_upsert_person(
         return None
 
 
-def runn_get_time_off_types() -> List[Dict[str, Any]]:
+def runn_map_category_to_endpoint(category: str) -> str:
     """
-    GET /time-off-types
-    Devuelve los tipos de time-off disponibles en la cuenta de Runn.
-    Cachea el resultado ya que estos tipos no cambian frecuentemente.
+    Mapea una categoría a un endpoint de time-off en v1.0.
+    
+    v1.0 tiene tres tipos:
+    - /time-offs/leave (PTO, vacation, sick leave, etc.)
+    - /time-offs/holidays (public holidays)
+    - /time-offs/rostered-off (RDOs, lieu days)
     """
-    global _TIME_OFF_TYPES_CACHE
-    
-    if _TIME_OFF_TYPES_CACHE is not None:
-        return _TIME_OFF_TYPES_CACHE
-    
-    url = f"{RUNN_BASE_URL}/time-off-types"
-    try:
-        resp = requests.get(url, headers=_runn_headers(), timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        _TIME_OFF_TYPES_CACHE = data if isinstance(data, list) else []
-        return _TIME_OFF_TYPES_CACHE
-    except Exception as e:
-        logger.exception(f"Failed to fetch time-off types: {e}")
-        return []
-
-
-def runn_map_category_to_type_id(category: str, reason: Optional[str] = None) -> Optional[int]:
-    """
-    Mapea una categoría de ChartHop a un timeOffTypeId de Runn.
-    
-    Estrategia:
-    1. Busca por nombre exacto en los tipos disponibles
-    2. Si no encuentra, usa el primer tipo disponible como fallback
-    3. Si hay un 'reason', intenta matchear por nombre
-    """
-    types = runn_get_time_off_types()
-    if not types:
-        logger.warning("No time-off types available in Runn")
-        return None
-    
     category_lower = category.lower()
-    reason_lower = (reason or "").lower()
     
-    # Mapeo de categorías comunes
-    category_map = {
-        "leave": ["annual leave", "vacation", "pto", "leave"],
-        "holidays": ["public holiday", "holiday", "bank holiday"],
-        "rostered-off": ["rostered day off", "rdo", "lieu"],
-        "sick": ["sick leave", "sick"],
-    }
+    if "holiday" in category_lower or "public" in category_lower:
+        return "holidays"
     
-    # Intenta match por razón primero
-    if reason_lower:
-        for ttype in types:
-            type_name = (ttype.get("name") or "").lower()
-            if reason_lower in type_name or type_name in reason_lower:
-                return ttype.get("id")
+    if "roster" in category_lower or "rostered" in category_lower or "lieu" in category_lower:
+        return "rostered-off"
     
-    # Luego por categoría
-    search_terms = category_map.get(category_lower, [category_lower])
-    for ttype in types:
-        type_name = (ttype.get("name") or "").lower()
-        for term in search_terms:
-            if term in type_name:
-                return ttype.get("id")
+    # Default: leave
+    return "leave"
+
+
+def runn_get_existing_leave(
+    person_id: int,
+    start_date: str,
+    end_date: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Verifica si ya existe un time-off de tipo "leave" para esta persona en estas fechas.
+    GET /time-offs/leave?personId={personId}
     
-    # Fallback: primer tipo disponible
-    logger.warning(f"No match for category '{category}', using first available type")
-    return types[0].get("id")
+    Esto ayuda con la idempotencia.
+    """
+    url = f"{RUNN_BASE_URL}/time-offs/leave"
+    params = {"personId": person_id}
+    
+    try:
+        resp = requests.get(url, headers=_runn_headers(), params=params, timeout=60)
+        if not resp.ok:
+            return None
+        
+        time_offs = resp.json()
+        if not isinstance(time_offs, list):
+            return None
+        
+        # Buscar coincidencia de fechas
+        for to in time_offs:
+            if (to.get("startDate") == start_date and 
+                to.get("endDate") == end_date):
+                return to
+        
+        return None
+    except Exception as e:
+        logger.exception(f"Failed to check existing leave: {e}")
+        return None
 
 
 def runn_create_timeoff(
@@ -165,37 +208,45 @@ def runn_create_timeoff(
     reason: Optional[str] = None,
 ) -> bool:
     """
-    POST /people/{personId}/time-off
+    POST /time-offs/{type}
     
-    Crea un registro de time-off en Runn.
+    Crea un registro de time-off en Runn v1.0.
+    
+    Tipos disponibles:
+    - leave: POST /time-offs/leave
+    - holidays: POST /time-offs/holidays  
+    - rostered-off: POST /time-offs/rostered-off
+    
+    IMPORTANTE: La API v1.0 hace merge automático de periodos que se traslapan.
     
     Payload esperado:
     {
+        "personId": <int>,
         "startDate": "YYYY-MM-DD",
         "endDate": "YYYY-MM-DD",
-        "timeOffTypeId": <int>,  # REQUERIDO
-        "note": "string"
+        "note": "string" (opcional)
     }
     """
-    # Obtener el timeOffTypeId apropiado
-    time_off_type_id = runn_map_category_to_type_id(category, reason)
-    if not time_off_type_id:
-        logger.error(f"Cannot create time-off: no valid timeOffTypeId for category '{category}'")
-        return False
+    # Determinar el endpoint correcto
+    endpoint_type = runn_map_category_to_endpoint(category)
+    url = f"{RUNN_BASE_URL}/time-offs/{endpoint_type}"
     
-    url = f"{RUNN_BASE_URL}/people/{person_id}/time-off"
     payload: Dict[str, Any] = {
+        "personId": person_id,
         "startDate": start_date,
         "endDate": end_date or start_date,
-        "timeOffTypeId": time_off_type_id,
     }
+    
     if note:
         payload["note"] = note
     
     try:
         resp = requests.post(url, headers=_runn_headers(), json=payload, timeout=60)
         if resp.status_code in (200, 201):
-            logger.info(f"Time-off created for person {person_id}: {start_date} to {end_date}")
+            logger.info(
+                f"Time-off created for person {person_id}: {start_date} to {end_date} "
+                f"(type: {endpoint_type})"
+            )
             return True
         
         # Log detallado del error
@@ -210,34 +261,24 @@ def runn_create_timeoff(
         return False
 
 
-def runn_get_existing_timeoff(
-    person_id: int,
-    start_date: str,
-    end_date: str,
-) -> Optional[Dict[str, Any]]:
+def runn_list_person_timeoffs(person_id: int, timeoff_type: str = "leave") -> List[Dict[str, Any]]:
     """
-    Verifica si ya existe un time-off para esta persona en estas fechas.
-    GET /people/{personId}/time-off
+    GET /people/{id}/time-offs/{type}
     
-    Esto ayuda con la idempotencia.
+    Lista los time-offs de una persona por tipo.
+    Útil para verificar qué existe antes de crear.
+    
+    Tipos: "leave", "holidays", "rostered-off"
     """
-    url = f"{RUNN_BASE_URL}/people/{person_id}/time-off"
+    url = f"{RUNN_BASE_URL}/people/{person_id}/time-offs/{timeoff_type}"
+    
     try:
         resp = requests.get(url, headers=_runn_headers(), timeout=60)
         if not resp.ok:
-            return None
+            return []
         
-        time_offs = resp.json()
-        if not isinstance(time_offs, list):
-            return None
-        
-        # Busca coincidencia exacta de fechas
-        for to in time_offs:
-            if (to.get("startDate") == start_date and 
-                to.get("endDate") == end_date):
-                return to
-        
-        return None
+        data = resp.json()
+        return data if isinstance(data, list) else []
     except Exception as e:
-        logger.exception(f"Failed to check existing time-off: {e}")
-        return None
+        logger.exception(f"Failed to list person time-offs: {e}")
+        return []
