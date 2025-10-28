@@ -22,17 +22,24 @@ def ch_webhook():
     if not entity and type_entity:
         entity = type_entity
 
-    print(f"CH evt: type={evtype_raw} entity={entity} entity_id={entity_id}")
+    print(f"CH evt: type={evtype_raw} entity={entity} entity_id={entity_id} action={action}")
     is_job = entity in ("job", "jobs")
     is_timeoff = entity in ("timeoff", "time off", "time-off") or type_entity == "timeoff"
     is_person = entity in ("person", "people") or type_entity == "person"
     is_create = action in ("create", "created")
     is_update = action in ("update", "updated", "change", "changed")
+    is_delete = action in ("delete", "deleted", "remove", "removed")
 
     if is_timeoff and entity_id:
         try:
-            task = enqueue_charthop_task("timeoff", entity_id)
-            print(f"Queued ChartHop timeoff task: {task}")
+            # Determinar el tipo de tarea según la acción
+            if is_delete:
+                task = enqueue_charthop_task("timeoff_delete", entity_id)
+                print(f"Queued ChartHop timeoff delete task: {task}")
+            else:
+                # Create o Update se manejan con la misma función (auto-detecta)
+                task = enqueue_charthop_task("timeoff", entity_id)
+                print(f"Queued ChartHop timeoff sync task: {task}")
         except Exception as exc:  # pragma: no cover - defensive logging
             print(f"Failed to enqueue timeoff task: {exc}")
             return "", 500

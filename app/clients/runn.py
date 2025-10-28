@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from app.utils.rate_limiter import DictCache, RateLimiter
+
 logger = logging.getLogger(__name__)
 
 RUNN_BASE_URL = os.getenv("RUNN_BASE_URL", "https://api.runn.io")
@@ -14,6 +16,12 @@ RUNN_API_TOKEN = os.getenv("RUNN_API_TOKEN", "")
 
 # Cache para roles
 _ROLES_CACHE: Optional[List[Dict[str, Any]]] = None
+
+# Rate limiter: 100 requests por minuto (ajustar según límites de Runn)
+_RATE_LIMITER = RateLimiter(max_requests=100, window_seconds=60)
+
+# Cache de personas: 5 minutos de TTL
+_PEOPLE_CACHE = DictCache(ttl_seconds=300)
 
 
 def _runn_headers() -> Dict[str, str]:
@@ -27,7 +35,9 @@ def _runn_headers() -> Dict[str, str]:
 def runn_get_people() -> List[Dict[str, Any]]:
     """
     GET /people (v1.0)
+    Con rate limiting.
     """
+    _RATE_LIMITER.wait_if_needed()
     url = f"{RUNN_BASE_URL}/people"
     headers = _runn_headers()
     resp = requests.get(url, headers=headers, timeout=60)
@@ -36,17 +46,46 @@ def runn_get_people() -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-def runn_find_person_by_email(email: str) -> Optional[Dict[str, Any]]:
+def runn_find_person_by_email(email: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
     """
-    Búsqueda simple por email (case-insensitive) en la lista de people.
+    Búsqueda por email (case-insensitive) con caché.
+
+    Args:
+        email: Email de la persona
+        use_cache: Si usar caché (default: True)
+
+    Returns:
+        Persona encontrada o None
     """
     if not email:
         return None
+
     email_low = email.strip().lower()
+
+    # Intentar del caché primero
+    if use_cache:
+        # Si el caché está expirado, recargarlo
+        if _PEOPLE_CACHE.is_expired():
+            _PEOPLE_CACHE.load(
+                loader_fn=runn_get_people,
+                key_fn=lambda p: (p.get("email") or "").strip().lower()
+            )
+
+        # Buscar en el caché
+        cached_person = _PEOPLE_CACHE.get(email_low)
+        if cached_person is not None:
+            return cached_person
+
+        # No está en caché, pero el caché está cargado
+        # Esto significa que la persona no existe
+        return None
+
+    # Sin caché: búsqueda directa
     for p in runn_get_people():
         em = (p.get("email") or "").strip().lower()
         if em and em == email_low:
             return p
+
     return None
 
 
@@ -206,19 +245,19 @@ def runn_create_timeoff(
     category: str = "leave",
     note: Optional[str] = None,
     reason: Optional[str] = None,
-) -> bool:
+) -> Optional[Dict[str, Any]]:
     """
     POST /time-offs/{type}
-    
+
     Crea un registro de time-off en Runn v1.0.
-    
+
     Tipos disponibles:
     - leave: POST /time-offs/leave
-    - holidays: POST /time-offs/holidays  
+    - holidays: POST /time-offs/holidays
     - rostered-off: POST /time-offs/rostered-off
-    
+
     IMPORTANTE: La API v1.0 hace merge automático de periodos que se traslapan.
-    
+
     Payload esperado:
     {
         "personId": <int>,
@@ -226,59 +265,169 @@ def runn_create_timeoff(
         "endDate": "YYYY-MM-DD",
         "note": "string" (opcional)
     }
+
+    Returns:
+        Objeto del time-off creado con id, personId, startDate, endDate, etc. o None si falla
     """
+    _RATE_LIMITER.wait_if_needed()
+
     # Determinar el endpoint correcto
     endpoint_type = runn_map_category_to_endpoint(category)
     url = f"{RUNN_BASE_URL}/time-offs/{endpoint_type}"
-    
+
     payload: Dict[str, Any] = {
         "personId": person_id,
         "startDate": start_date,
         "endDate": end_date or start_date,
     }
-    
+
     if note:
         payload["note"] = note
-    
+
     try:
         resp = requests.post(url, headers=_runn_headers(), json=payload, timeout=60)
         if resp.status_code in (200, 201):
+            result = resp.json()
             logger.info(
                 f"Time-off created for person {person_id}: {start_date} to {end_date} "
-                f"(type: {endpoint_type})"
+                f"(type: {endpoint_type}, id: {result.get('id')})"
             )
-            return True
-        
+            return result
+
         # Log detallado del error
         logger.error(
             f"runn_create_timeoff failed [{resp.status_code}] {url}\n"
             f"Payload: {payload}\n"
             f"Response: {resp.text}"
         )
-        return False
+        return None
     except Exception as e:
         logger.exception(f"runn_create_timeoff exception: {e}")
-        return False
+        return None
 
 
 def runn_list_person_timeoffs(person_id: int, timeoff_type: str = "leave") -> List[Dict[str, Any]]:
     """
     GET /people/{id}/time-offs/{type}
-    
+
     Lista los time-offs de una persona por tipo.
     Útil para verificar qué existe antes de crear.
-    
+
     Tipos: "leave", "holidays", "rostered-off"
     """
+    _RATE_LIMITER.wait_if_needed()
+
     url = f"{RUNN_BASE_URL}/people/{person_id}/time-offs/{timeoff_type}"
-    
+
     try:
         resp = requests.get(url, headers=_runn_headers(), timeout=60)
         if not resp.ok:
             return []
-        
+
         data = resp.json()
         return data if isinstance(data, list) else []
     except Exception as e:
         logger.exception(f"Failed to list person time-offs: {e}")
         return []
+
+
+def runn_update_timeoff(
+    *,
+    timeoff_id: int,
+    category: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    note: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    PUT /time-offs/{type}/{id}
+
+    Actualiza un time-off existente en Runn.
+
+    Args:
+        timeoff_id: ID del time-off en Runn
+        category: Categoría (leave, holidays, rostered-off)
+        start_date: Nueva fecha de inicio (opcional)
+        end_date: Nueva fecha de fin (opcional)
+        note: Nueva nota (opcional)
+
+    Returns:
+        Time-off actualizado o None si falla
+    """
+    _RATE_LIMITER.wait_if_needed()
+
+    endpoint_type = runn_map_category_to_endpoint(category)
+    url = f"{RUNN_BASE_URL}/time-offs/{endpoint_type}/{timeoff_id}"
+
+    payload: Dict[str, Any] = {}
+
+    if start_date:
+        payload["startDate"] = start_date
+    if end_date:
+        payload["endDate"] = end_date
+    if note is not None:  # Permitir nota vacía
+        payload["note"] = note
+
+    if not payload:
+        logger.warning(f"runn_update_timeoff: no changes provided for {timeoff_id}")
+        return None
+
+    try:
+        resp = requests.put(url, headers=_runn_headers(), json=payload, timeout=60)
+        if resp.status_code in (200, 201):
+            result = resp.json()
+            logger.info(f"Time-off updated: {timeoff_id} (type: {endpoint_type})")
+            return result
+
+        logger.error(
+            f"runn_update_timeoff failed [{resp.status_code}] {url}\n"
+            f"Payload: {payload}\n"
+            f"Response: {resp.text}"
+        )
+        return None
+    except Exception as e:
+        logger.exception(f"runn_update_timeoff exception: {e}")
+        return None
+
+
+def runn_delete_timeoff(timeoff_id: int, category: str) -> bool:
+    """
+    DELETE /time-offs/{type}/{id}
+
+    Elimina un time-off de Runn.
+
+    Args:
+        timeoff_id: ID del time-off en Runn
+        category: Categoría (leave, holidays, rostered-off)
+
+    Returns:
+        True si se eliminó exitosamente, False en caso contrario
+    """
+    _RATE_LIMITER.wait_if_needed()
+
+    endpoint_type = runn_map_category_to_endpoint(category)
+    url = f"{RUNN_BASE_URL}/time-offs/{endpoint_type}/{timeoff_id}"
+
+    try:
+        resp = requests.delete(url, headers=_runn_headers(), timeout=60)
+        if resp.status_code in (200, 204):
+            logger.info(f"Time-off deleted: {timeoff_id} (type: {endpoint_type})")
+            return True
+
+        logger.error(
+            f"runn_delete_timeoff failed [{resp.status_code}] {url}\n"
+            f"Response: {resp.text}"
+        )
+        return False
+    except Exception as e:
+        logger.exception(f"runn_delete_timeoff exception: {e}")
+        return False
+
+
+def runn_clear_people_cache() -> None:
+    """
+    Limpia el caché de personas.
+    Útil para forzar recarga después de cambios importantes.
+    """
+    _PEOPLE_CACHE.clear()
+    logger.info("Runn people cache cleared")

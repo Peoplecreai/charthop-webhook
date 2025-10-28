@@ -3,6 +3,7 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from app.services.runn_sync import (
+    delete_runn_timeoff_event,
     sync_runn_onboarding_event,
     sync_runn_timeoff_event,
 )
@@ -21,6 +22,8 @@ def run_charthop_worker():
 
     if kind == "timeoff":
         result = sync_runn_timeoff_event(entity_id)
+    elif kind == "timeoff_delete":
+        result = delete_runn_timeoff_event(entity_id)
     elif kind == "person":
         result = sync_runn_onboarding_event(entity_id)
     else:
