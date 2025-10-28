@@ -11,7 +11,7 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from app.utils.state_gcs import get_state, save_state
+from app.utils.state_gcs import get_state, save_state_keyed
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ class SyncMetrics:
     def _save_metrics(self) -> None:
         """Guarda métricas a GCS."""
         try:
-            save_state(METRICS_STATE_KEY, json.dumps(self._metrics))
+            save_state_keyed(METRICS_STATE_KEY, json.dumps(self._metrics))
         except Exception as e:
             logger.error(f"Failed to save sync metrics to GCS: {e}")
 

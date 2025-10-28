@@ -13,7 +13,7 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from app.utils.state_gcs import get_state, save_state
+from app.utils.state_gcs import get_state, save_state_keyed
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ class TimeoffMapping:
     def _save_mapping(self) -> None:
         """Guarda el mapping a GCS."""
         try:
-            save_state(TIMEOFF_MAPPING_STATE_KEY, json.dumps(self._mapping))
+            save_state_keyed(TIMEOFF_MAPPING_STATE_KEY, json.dumps(self._mapping))
         except Exception as e:
             logger.error(f"Failed to save timeoff mapping to GCS: {e}")
 
