@@ -26,6 +26,12 @@ HTTP_TIMEOUT = _config.HTTP_TIMEOUT
 ch_headers = _config.ch_headers
 strip_accents_and_non_alnum = _config.strip_accents_and_non_alnum
 
+CTC_FIELD_CODES = [
+    code.strip()
+    for code in os.getenv("CH_JOB_CTC_CODES", "Costtocompany,CostToCompany").split(",")
+    if code.strip()
+]
+
 # =========================
 #   HTTP helpers
 # =========================
@@ -197,8 +203,81 @@ def ch_get_job_employment(job_id: str, session: Optional[Session] = None) -> Opt
             session.close()
 
 
+def ch_get_job_id_for_person(
+    person_id: str,
+    session: Optional[Session] = None,
+) -> Optional[str]:
+    """Resolve the active job id for a person."""
+
+    person_id = (person_id or "").strip()
+    if not person_id:
+        return None
+
+    own = False
+    if session is None:
+        session = _new_session()
+        own = True
+
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job"
+        params = {
+            "q": f'open:filled AND personId="{person_id}"',
+            "fields": "id",
+            "limit": "1",
+        }
+        payload = _get_json(session, url, params)
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        if isinstance(data, list):
+            row = data[0] if data else None
+        else:
+            row = data
+        if not isinstance(row, dict):
+            return None
+        job_id = (row.get("id") or "").strip()
+        return job_id or None
+    finally:
+        if own:
+            session.close()
+
+
+def ch_get_job_ctc(
+    job_id: str,
+    session: Optional[Session] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch Cost to Company money field from a job."""
+
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return None
+
+    own = False
+    if session is None:
+        session = _new_session()
+        own = True
+
+    fields = ",".join(code for code in CTC_FIELD_CODES if code)
+    if not fields:
+        return None
+
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        payload = _get_json(session, url, {"fields": fields}) or {}
+        for code in CTC_FIELD_CODES:
+            code = code.strip()
+            if not code:
+                continue
+            money = payload.get(code)
+            if isinstance(money, dict) and "amount" in money:
+                return money
+        return None
+    finally:
+        if own:
+            session.close()
+
+
 PEOPLE_COMPENSATION_FIELDS = ",".join([
     "id",
+    "jobId",
     "contact.workEmail",
     "contact.personalEmail",
     "name.first",
@@ -262,15 +341,35 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
             last = (payload.get("name.last") or "").strip()
             name_full = f"{first} {last}".strip()
 
-        # Extraer compensación
-        cost_to_company = payload.get("comp.costtocompany")
-        if cost_to_company is not None:
-            try:
-                cost_to_company = float(cost_to_company)
-            except (ValueError, TypeError):
-                cost_to_company = None
+        # Obtener jobId explícito y Cost to Company desde el Job
+        job_id = (payload.get("jobId") or "").strip()
+        if not job_id:
+            job_id = ch_get_job_id_for_person(person_id, session=session)
 
-        currency = (payload.get("comp.currency") or "USD").strip()
+        ctc_money = ch_get_job_ctc(job_id, session=session) if job_id else None
+
+        cost_to_company: Optional[float] = None
+        currency = "USD"
+
+        if ctc_money:
+            amount = ctc_money.get("amount")
+            if amount is not None:
+                try:
+                    cost_to_company = float(amount)
+                except (ValueError, TypeError):
+                    cost_to_company = None
+            currency = (ctc_money.get("currency") or "USD").strip() or "USD"
+
+        # Fallback a los campos legacy si el Job no expone CTC
+        if cost_to_company is None:
+            legacy_ctc = payload.get("comp.costtocompany")
+            if legacy_ctc is not None:
+                try:
+                    cost_to_company = float(legacy_ctc)
+                except (ValueError, TypeError):
+                    cost_to_company = None
+            if not currency:
+                currency = (payload.get("comp.currency") or "USD").strip() or "USD"
 
         # Employment type
         employment_type = (
@@ -283,8 +382,9 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
             "person_id": person_id,
             "email": email,
             "name": name_full,
+            "job_id": job_id or None,
             "cost_to_company": cost_to_company,
-            "currency": currency,
+            "currency": currency or "USD",
             "employment_type": employment_type,
         }
 
