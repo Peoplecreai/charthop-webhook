@@ -137,3 +137,32 @@ def runn_compensation():
             },
             500,
         )
+
+
+@bp_cron.route("/cron/charthop/recalculate-ctc", methods=["GET", "POST"])
+def charthop_recalculate_ctc():
+    """
+    Encola una tarea batch para RECALCULAR el CTC en ChartHop
+    basado en la fórmula personalizada.
+    """
+    t0 = time.time()
+
+    try:
+        task = enqueue_charthop_task("ctc_recalculate_batch", "full_batch_run")
+        elapsed_ms = int((time.time() - t0) * 1000)
+        
+        return _json_ok(
+            {
+                "status": "queued",
+                "elapsed_ms": elapsed_ms,
+                "task_kind": "ctc_recalculate_batch",
+                "task": task,
+            },
+            200,
+        )
+    except Exception as exc:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        return _json_ok(
+            {"status": "error", "elapsed_ms": elapsed_ms, "message": str(exc)},
+            500,
+        )

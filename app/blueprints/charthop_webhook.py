@@ -26,6 +26,7 @@ def ch_webhook():
     is_job = entity in ("job", "jobs")
     is_timeoff = entity in ("timeoff", "time off", "time-off") or type_entity == "timeoff"
     is_person = entity in ("person", "people") or type_entity == "person"
+    is_comp = entity in ("compensation", "comp") or type_entity == "comp"
     is_create = action in ("create", "created")
     is_update = action in ("update", "updated", "change", "changed")
     is_delete = action in ("delete", "deleted", "remove", "removed")
@@ -56,19 +57,22 @@ def ch_webhook():
 
     # Detectar cambios de compensación
     is_compensation = (
-        (is_person and (is_create or is_update)) or
-        entity in ("compensation", "comp") or
-        type_entity in ("compensation", "comp")
+        is_comp
+        or (is_person and (is_create or is_update))
+        or type_entity in ("compensation", "comp")
     )
 
     # Si es un evento de persona con update, podría ser cambio de compensación
     # También detectar eventos explícitos de compensación
     if is_compensation and entity_id:
         try:
-            task = enqueue_charthop_task("compensation", entity_id)
-            print(f"Queued ChartHop compensation task: {task}")
+            task_calc = enqueue_charthop_task("ctc_recalculate", entity_id)
+            print(f"Queued ChartHop CTC RECALCULATE task: {task_calc}")
+
+            task_sync = enqueue_charthop_task("compensation", entity_id)
+            print(f"Queued ChartHop compensation task: {task_sync}")
         except Exception as exc:  # pragma: no cover - defensive logging
-            print(f"Failed to enqueue compensation task: {exc}")
+            print(f"Failed to enqueue compensation task(s): {exc}")
             return "", 500
         return "", 200
 
