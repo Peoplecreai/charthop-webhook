@@ -397,7 +397,7 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
 
         cost_to_company: Optional[float] = None
         currency = "USD"
-        base_comp: Optional[float] = None
+        base_comp: float = 0.0
 
         if ctc_money:
             amount = ctc_money.get("amount")
@@ -418,11 +418,13 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
             base_raw = job_comp_fields.get("base")
             if base_raw is None:
                 base_raw = payload.get("comp.base")
-            try:
-                if base_raw is not None:
+            if base_raw is not None:
+                try:
                     base_comp = float(base_raw)
-            except (ValueError, TypeError):
-                base_comp = None
+                except (ValueError, TypeError):
+                    base_comp = 0.0
+            else:
+                base_comp = 0.0
 
             job_currency = job_comp_fields.get("currency")
             if job_currency:
@@ -432,13 +434,14 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
             if employment_override:
                 payload.setdefault("employment", employment_override)
 
-        if base_comp is None:
+        # Solo intentar el fallback si seguimos sin una base proveniente del Job
+        if base_comp == 0.0 and not job_comp_fields:
             base_raw = payload.get("comp.base")
-            try:
-                if base_raw is not None:
+            if base_raw is not None:
+                try:
                     base_comp = float(base_raw)
-            except (ValueError, TypeError):
-                base_comp = None
+                except (ValueError, TypeError):
+                    pass
 
         # Fallback a los campos legacy si el Job no expone CTC
         if cost_to_company is None:
