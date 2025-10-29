@@ -4,7 +4,7 @@ import os
 import time
 from typing import Optional
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
 from app.services.culture_amp import export_culture_amp_snapshot
 from app.tasks.cloud import enqueue_http_task
@@ -55,9 +55,19 @@ def enqueue_export_task(payload: Optional[dict] = None) -> dict:
 @bp_tasks.post("/tasks/export-culture-amp")
 def run_export_task():
     t0 = time.time()
+    payload = request.get_json(silent=True) or {}
+    dry_run = bool(payload.get("dry_run"))
+
     try:
-        result = export_culture_amp_snapshot()
+        result = export_culture_amp_snapshot(dry_run=dry_run)
         elapsed_ms = int((time.time() - t0) * 1000)
-        return jsonify({"ok": True, "elapsed_ms": elapsed_ms, "result": result}), 200
+        body = {
+            "ok": True,
+            "elapsed_ms": elapsed_ms,
+            "result": result,
+        }
+        if dry_run:
+            body["dry_run"] = True
+        return jsonify(body), 200
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500

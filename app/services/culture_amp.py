@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Dict
 
@@ -22,12 +23,17 @@ from app.clients.charthop import (
     _get_json,
 )
 
+logger = logging.getLogger(__name__)
 
-def _upload_csv(text: str) -> None:
+
+def _upload_csv(text: str, *, dry_run: bool = False) -> None:
     if not text.endswith("\n"):
         text += "\n"
     if not CA_SFTP_HOST or not CA_SFTP_USER or not CA_SFTP_KEY:
         raise RuntimeError("Credenciales SFTP incompletas: host, user y key son obligatorios")
+    if dry_run:
+        logger.info("dry_run=True: skip SFTP upload to Culture Amp")
+        return
     sftp_upload(
         host=CA_SFTP_HOST,
         username=CA_SFTP_USER,
@@ -37,12 +43,12 @@ def _upload_csv(text: str) -> None:
     )
 
 
-def _full_export() -> dict:
+def _full_export(*, dry_run: bool = False) -> dict:
     rows = build_culture_amp_rows()
     csv_text = culture_amp_csv_from_rows(rows)
     if not csv_text or csv_text.count("\n") <= 1:
         raise RuntimeError("CSV vacío para Culture Amp")
-    _upload_csv(csv_text)
+    _upload_csv(csv_text, dry_run=dry_run)
 
     # Actualiza manifest con la foto completa (útil para cambiar a delta luego)
     current_meta: Dict[str, dict] = {}
@@ -53,12 +59,20 @@ def _full_export() -> dict:
             "ch_person_id": "",  # no lo tenemos aquí; se poblará en el primer delta
             "row": r,
         }
-    save_state({"version": 1, "rows": current_meta})
+    if dry_run:
+        logger.info("dry_run=True: skip save_state after full export")
+    else:
+        save_state({"version": 1, "rows": current_meta})
 
-    return {"rows": len(rows), "remote_path": "/employees.csv", "mode": "full"}
+    return {
+        "rows": len(rows),
+        "remote_path": "/employees.csv",
+        "mode": "full",
+        "dry_run": dry_run,
+    }
 
 
-def export_culture_amp_snapshot() -> dict:
+def export_culture_amp_snapshot(*, dry_run: bool = False) -> dict:
     """
     Si CA_EXPORT_MODE=delta => sube solo filas nuevas/cambiadas/terminadas.
     En otro caso => snapshot completo.
@@ -68,7 +82,7 @@ def export_culture_amp_snapshot() -> dict:
         mode = "full"
 
     if mode == "full":
-        return _full_export()
+        return _full_export(dry_run=dry_run)
 
     # --------- DELTA ----------
     prev = load_state() or {}
@@ -148,16 +162,19 @@ def export_culture_amp_snapshot() -> dict:
                 for eid in current.keys()
             },
         }
-        save_state(new_manifest)
-        return {"rows_sent": 0, "delta": True, "skipped": True}
+        if dry_run:
+            logger.info("dry_run=True: skip save_state for delta manifest (no changes)")
+        else:
+            save_state(new_manifest)
+        return {"rows_sent": 0, "delta": True, "skipped": True, "dry_run": dry_run}
 
     # Genera CSV de delta y sube
     csv_text = culture_amp_csv_from_rows(to_send.values())
     if not csv_text or csv_text.count("\n") <= 1:
         # En teoría puede pasar si todos eran líneas vacías; por seguridad no subimos
-        return {"rows_sent": 0, "delta": True, "skipped": True}
+        return {"rows_sent": 0, "delta": True, "skipped": True, "dry_run": dry_run}
 
-    _upload_csv(csv_text)
+    _upload_csv(csv_text, dry_run=dry_run)
 
     # Guarda el nuevo manifest (solo actuales; los faltantes desaparecen del estado)
     new_manifest = {
@@ -171,6 +188,14 @@ def export_culture_amp_snapshot() -> dict:
             for eid in current.keys()
         },
     }
-    save_state(new_manifest)
+    if dry_run:
+        logger.info("dry_run=True: skip save_state for delta manifest")
+    else:
+        save_state(new_manifest)
 
-    return {"rows_sent": len(to_send), "delta": True, "remote_path": "/employees.csv"}
+    return {
+        "rows_sent": len(to_send),
+        "delta": True,
+        "remote_path": "/employees.csv",
+        "dry_run": dry_run,
+    }
