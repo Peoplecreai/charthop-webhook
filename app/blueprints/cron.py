@@ -7,7 +7,8 @@ from typing import Optional
 from flask import Blueprint, jsonify, request
 
 from app.tasks.ca_export import enqueue_export_task
-from app.services.runn_sync import sync_runn_onboarding, sync_runn_timeoff, sync_runn_compensation
+from app.tasks.charthop_dispatcher import enqueue_charthop_task
+from app.services.runn_sync import sync_runn_onboarding, sync_runn_timeoff
 
 bp_cron = Blueprint("cron", __name__)
 
@@ -98,31 +99,30 @@ def runn_timeoff():
 @bp_cron.route("/cron/runn/compensation", methods=["GET", "POST"])
 def runn_compensation():
     """
-    Sincronización batch de compensaciones ChartHop -> Runn.
+    Encola una sincronización batch de compensaciones ChartHop -> Runn.
 
-    Actualiza el costPerHour en contratos activos basado en
-    CosttoCompany de ChartHop dividido entre 1,856 horas efectivas.
+    Responde rápido para evitar 504 del Cloud Scheduler y deja el trabajo
+    pesado al worker.
 
     Query params opcionales:
     - date: Fecha de referencia para determinar contratos activos (YYYY-MM-DD)
-
-    Ejemplo:
-    POST /cron/runn/compensation
-    POST /cron/runn/compensation?date=2025-01-15
     """
     t0 = time.time()
     ref = request.args.get("date")
     reference = _parse_yyyy_mm_dd(ref) if ref else None
 
+    entity_id = reference.isoformat() if reference else "batch_sync"
+
     try:
-        result = sync_runn_compensation(reference)
+        task = enqueue_charthop_task("compensation_sync_batch", entity_id)
         elapsed_ms = int((time.time() - t0) * 1000)
         return _json_ok(
             {
-                "status": "ok",
+                "status": "queued",
                 "elapsed_ms": elapsed_ms,
                 "reference_date": reference.isoformat() if reference else None,
-                "result": result,
+                "task_kind": "compensation_sync_batch",
+                "task": task,
             },
             200,
         )
