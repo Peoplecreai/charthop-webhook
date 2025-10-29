@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def _calculate_ctc_from_formula(
-    base_comp: float, employment_type: str, country: str
+    base_comp: float, esquema_contratacion: str
 ) -> float:
     """
     Aplica la fórmula personalizada para calcular el Cost to Company.
@@ -22,13 +22,14 @@ def _calculate_ctc_from_formula(
     if base_comp <= 0:
         return 0.0
 
-    is_contractor = (employment_type or "").strip().lower() == "contractor"
-    is_mx = (country or "").strip().upper() == "MX"
+    esquema = (esquema_contratacion or "").strip().lower()
 
     # 1. Pension/Superannuation (USD)
     pension = 0.0
-    if is_contractor:
-        pension = 240.0 if is_mx else 720.0
+    if esquema == "voiz":
+        pension = 240.0
+    elif esquema == "ontop":
+        pension = 720.0
 
     # 2. Healthcare (USD)
     healthcare = 800.0
@@ -62,8 +63,7 @@ def calculate_and_update_ch_ctc(person_id: str) -> Dict[str, Any]:
 
     job_id = comp_data.get("job_id")
     base_comp = comp_data.get("base_comp", 0.0)
-    employment_type = comp_data.get("employment_type", "")
-    country = comp_data.get("country", "")
+    esquema_contratacion = comp_data.get("esquema_contratacion")
     currency = comp_data.get("currency", "USD")
 
     if not job_id:
@@ -75,7 +75,7 @@ def calculate_and_update_ch_ctc(person_id: str) -> Dict[str, Any]:
         return {"status": "skipped", "reason": "missing_base_comp", "person_id": person_id, "job_id": job_id}
 
     # 2. Calcular
-    new_ctc = _calculate_ctc_from_formula(base_comp, employment_type, country)
+    new_ctc = _calculate_ctc_from_formula(base_comp, esquema_contratacion)
 
     if new_ctc <= 0:
         metrics.increment_counter("ctc_calc_skipped")
@@ -94,8 +94,7 @@ def calculate_and_update_ch_ctc(person_id: str) -> Dict[str, Any]:
             "job_id": job_id,
             "new_ctc": new_ctc,
             "base_comp": base_comp,
-            "country": country,
-            "employment_type": employment_type,
+            "esquema_contratacion": esquema_contratacion,
         }
     except Exception as e:
         logger.error(

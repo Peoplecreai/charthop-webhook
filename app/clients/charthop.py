@@ -311,7 +311,12 @@ def ch_get_job_compensation_fields(
         payload = _get_json(
             session,
             url,
-            {"fields": "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,employment"},
+            {
+                "fields": (
+                    "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,"
+                    "employment,fields.esquemaDeContratacion"
+                )
+            },
         ) or {}
 
         # ChartHop responses sometimes flatten field names ("comp.base")
@@ -345,10 +350,16 @@ def ch_get_job_compensation_fields(
 
         employment = payload.get("employment")
 
+        job_fields = payload.get("fields") or {}
+        esquema_contratacion = job_fields.get("esquemaDeContratacion")
+        if esquema_contratacion is None:
+            esquema_contratacion = payload.get("fields.esquemaDeContratacion")
+
         return {
             "base": comp_base,
             "currency": comp_currency,
             "employment": employment,
+            "esquema_contratacion": esquema_contratacion,
         }
     finally:
         if own:
@@ -416,6 +427,7 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
         cost_to_company: Optional[float] = None
         currency = "USD"
         base_comp: float = 0.0  # <-- Inicializar a 0.0 en lugar de None
+        esquema_contratacion: Optional[str] = None
 
         if ctc_money:
             amount = ctc_money.get("amount")
@@ -451,6 +463,8 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
             employment_override = job_comp_fields.get("employment")
             if employment_override:
                 payload.setdefault("employment", employment_override)
+
+            esquema_contratacion = job_comp_fields.get("esquema_contratacion")
 
         # Solo intentar el fallback si seguimos sin una base proveniente del Job
         if base_comp == 0.0 and not job_comp_fields:
@@ -490,6 +504,7 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
             "currency": currency or "USD",
             "employment_type": employment_type,
             "base_comp": base_comp,
+            "esquema_contratacion": esquema_contratacion,
             "country": country,
         }
 
