@@ -923,7 +923,7 @@ def sync_runn_compensation(reference: dt.date | None = None) -> Dict[str, Any]:
             "results": [...]
         }
     """
-    from app.clients.charthop import ch_fetch_people_with_compensation
+    from app.clients.charthop import ch_get_person_compensation, ch_iter_people_v2
     from app.clients.runn import (
         runn_find_person_by_email,
         runn_get_active_contracts,
@@ -934,22 +934,37 @@ def sync_runn_compensation(reference: dt.date | None = None) -> Dict[str, Any]:
     reference = reference or dt.date.today()
     reference_str = reference.isoformat()
 
-    # Obtener todas las personas con compensación de ChartHop
-    people = ch_fetch_people_with_compensation(active_only=True)
-
     results: List[Dict[str, Any]] = []
     total_contracts_updated = 0
+    processed = 0
 
-    for person_data in people:
-        person_id = person_data.get("person_id", "")
-        email = person_data.get("email", "")
-        cost_to_company = person_data.get("cost_to_company")
+    for person in ch_iter_people_v2("id"):
+        person_id = (person.get("id") or "").strip()
+        if not person_id:
+            continue
+
+        processed += 1
+
+        comp_data = ch_get_person_compensation(person_id)
+
+        if not comp_data:
+            results.append({
+                "person_id": person_id,
+                "status": "skipped",
+                "reason": "unable to load compensation data",
+            })
+            continue
+
+        email = comp_data.get("email", "")
+        job_id = comp_data.get("job_id")
+        cost_to_company = comp_data.get("cost_to_company")
 
         if not email:
             results.append({
                 "person_id": person_id,
                 "status": "skipped",
-                "reason": "missing email"
+                "reason": "missing email",
+                "job_id": job_id,
             })
             continue
 
@@ -958,7 +973,8 @@ def sync_runn_compensation(reference: dt.date | None = None) -> Dict[str, Any]:
                 "person_id": person_id,
                 "email": email,
                 "status": "skipped",
-                "reason": "missing or invalid cost to company"
+                "reason": "missing or invalid cost to company",
+                "job_id": job_id,
             })
             continue
 
@@ -970,7 +986,9 @@ def sync_runn_compensation(reference: dt.date | None = None) -> Dict[str, Any]:
                 "person_id": person_id,
                 "email": email,
                 "status": "skipped",
-                "reason": "invalid cost per hour"
+                "reason": "invalid cost per hour",
+                "job_id": job_id,
+                "cost_to_company": cost_to_company,
             })
             continue
 
@@ -982,7 +1000,8 @@ def sync_runn_compensation(reference: dt.date | None = None) -> Dict[str, Any]:
                 "person_id": person_id,
                 "email": email,
                 "status": "skipped",
-                "reason": "person not found in Runn"
+                "reason": "person not found in Runn",
+                "job_id": job_id,
             })
             continue
 
@@ -1000,7 +1019,8 @@ def sync_runn_compensation(reference: dt.date | None = None) -> Dict[str, Any]:
                 "email": email,
                 "runn_person_id": runn_person_id,
                 "status": "skipped",
-                "reason": "no active contracts"
+                "reason": "no active contracts",
+                "job_id": job_id,
             })
             continue
 
@@ -1040,17 +1060,19 @@ def sync_runn_compensation(reference: dt.date | None = None) -> Dict[str, Any]:
         results.append({
             "person_id": person_id,
             "email": email,
-            "name": person_data.get("name"),
+            "name": comp_data.get("name"),
             "status": status,
             "cost_to_company": cost_to_company,
             "cost_per_hour": cost_per_hour,
+            "currency": comp_data.get("currency"),
             "runn_person_id": runn_person_id,
             "contracts_updated": contracts_updated,
             "contracts_failed": contracts_failed,
+            "job_id": job_id,
         })
 
     summary = {
-        "processed": len(people),
+        "processed": processed,
         "synced": sum(1 for r in results if r.get("status") == "synced"),
         "skipped": sum(1 for r in results if r.get("status") == "skipped"),
         "error": sum(1 for r in results if r.get("status") == "error"),
