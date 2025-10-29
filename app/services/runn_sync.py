@@ -678,15 +678,20 @@ def delete_runn_timeoff_event(timeoff_id: str) -> Dict[str, Any]:
 # Compensación / Cost Per Hour
 # -------------------------
 
-# Horas efectivas anuales trabajadas (configurable via env)
-ANNUAL_EFFECTIVE_HOURS = float(os.getenv("ANNUAL_EFFECTIVE_HOURS", "1856"))
+# Horas anuales usadas para convertir CTC a costPerHour (configurable via env)
+RUNN_ANNUAL_HOURS = float(
+    os.getenv(
+        "RUNN_ANNUAL_HOURS",
+        os.getenv("ANNUAL_EFFECTIVE_HOURS", "1856"),
+    )
+)
 
 
 def _calculate_cost_per_hour(cost_to_company: float) -> float:
     """
     Calcula el costo por hora dado el CosttoCompany anualizado.
 
-    Formula: costPerHour = CosttoCompany / ANNUAL_EFFECTIVE_HOURS
+    Formula: costPerHour = CosttoCompany / RUNN_ANNUAL_HOURS
 
     Args:
         cost_to_company: Costo anual total (CosttoCompany de ChartHop)
@@ -697,7 +702,10 @@ def _calculate_cost_per_hour(cost_to_company: float) -> float:
     if cost_to_company <= 0:
         return 0.0
 
-    cost_per_hour = cost_to_company / ANNUAL_EFFECTIVE_HOURS
+    if RUNN_ANNUAL_HOURS <= 0:
+        return 0.0
+
+    cost_per_hour = cost_to_company / RUNN_ANNUAL_HOURS
     return round(cost_per_hour, 2)
 
 
@@ -707,7 +715,7 @@ def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
 
     Proceso:
     1. Obtener CosttoCompany de ChartHop
-    2. Calcular costPerHour = CosttoCompany / 1,856
+    2. Calcular costPerHour = CosttoCompany / RUNN_ANNUAL_HOURS
     3. Buscar persona en Runn por email
     4. Obtener contratos activos
     5. Actualizar costPerHour en cada contrato activo
@@ -759,12 +767,14 @@ def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
 
     email = comp_data.get("email", "")
     cost_to_company = comp_data.get("cost_to_company")
+    job_id = comp_data.get("job_id")
 
     if not email:
         skip_result = {
             "status": "skipped",
             "reason": "missing email",
-            "person_id": person_id
+            "person_id": person_id,
+            "job_id": job_id,
         }
         metrics.increment_counter("compensation_skipped")
         return skip_result
@@ -774,7 +784,8 @@ def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
             "status": "skipped",
             "reason": "missing or invalid cost to company",
             "person_id": person_id,
-            "email": email
+            "email": email,
+            "job_id": job_id
         }
         metrics.increment_counter("compensation_skipped")
         return skip_result
@@ -788,6 +799,7 @@ def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
             "reason": "calculated cost per hour is invalid",
             "person_id": person_id,
             "email": email,
+            "job_id": job_id,
             "cost_to_company": cost_to_company
         }
         metrics.increment_counter("compensation_skipped")
@@ -801,7 +813,8 @@ def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
             "status": "skipped",
             "reason": "person not found in Runn",
             "person_id": person_id,
-            "email": email
+            "email": email,
+            "job_id": job_id
         }
         metrics.increment_counter("compensation_skipped")
         return skip_result
@@ -817,6 +830,7 @@ def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
             "reason": "no active contracts",
             "person_id": person_id,
             "email": email,
+            "job_id": job_id,
             "runn_person_id": runn_person_id
         }
         metrics.increment_counter("compensation_skipped")
@@ -834,12 +848,18 @@ def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
         # Verificar si ya tiene el mismo costo (evitar updates innecesarios)
         current_cost = contract.get("costPerHour")
         if current_cost is not None:
-            current_cost = round(float(current_cost), 2)
-            if current_cost == cost_per_hour:
-                logger.info(
-                    f"Contract {contract_id} already has cost {cost_per_hour}/hour, skipping"
-                )
-                continue
+            try:
+                current_cost_float = float(current_cost)
+            except (TypeError, ValueError):
+                current_cost_float = None
+            else:
+                if abs(current_cost_float - cost_per_hour) < 0.01:
+                    logger.info(
+                        "Contract %s already has cost %.2f/hour (difference < 0.01), skipping",
+                        contract_id,
+                        current_cost_float,
+                    )
+                    continue
 
         result = runn_update_contract_cost(contract_id, cost_per_hour)
 
@@ -871,6 +891,7 @@ def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
         "status": status,
         "person_id": person_id,
         "email": email,
+        "job_id": job_id,
         "name": comp_data.get("name"),
         "cost_to_company": cost_to_company,
         "currency": comp_data.get("currency", "USD"),
