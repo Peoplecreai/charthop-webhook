@@ -415,7 +415,7 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
 
         cost_to_company: Optional[float] = None
         currency = "USD"
-        base_comp: float = 0.0
+        base_comp: float = 0.0  # <-- Inicializar a 0.0 en lugar de None
 
         if ctc_money:
             amount = ctc_money.get("amount")
@@ -438,11 +438,11 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
                 base_raw = payload.get("comp.base")
             if base_raw is not None:
                 try:
-                    base_comp = float(base_raw)
+                    base_comp = float(base_raw)  # Asignar si es válido
                 except (ValueError, TypeError):
-                    base_comp = 0.0
+                    base_comp = 0.0  # Usar 0.0 si la conversión falla
             else:
-                base_comp = 0.0
+                base_comp = 0.0  # Usar 0.0 si base_raw es None
 
             job_currency = job_comp_fields.get("currency")
             if job_currency:
@@ -827,11 +827,11 @@ def ch_update_job_ctc(job_id: str, new_ctc: float, currency: str = "USD") -> Dic
     try:
         url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
 
-        # El payload para campos nativos como 'comp' es diferente
-        # al de 'fields' (campos personalizados).
+        # El payload para campos nativos debe usar claves de nivel superior,
+        # según la especificación del endpoint PATCH /v2/job/{jobId}.
         payload = {
-            "comp": {
-                "costtocompany": round(new_ctc, 2),
+            "costToCompany": {
+                "amount": round(new_ctc, 2),
                 "currency": currency,
             }
         }
