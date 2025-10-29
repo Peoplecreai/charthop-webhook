@@ -486,3 +486,131 @@ def runn_clear_people_cache() -> None:
     """
     _PEOPLE_CACHE.clear()
     logger.info("Runn people cache cleared")
+
+
+def runn_get_person_contracts(person_id: int) -> List[Dict[str, Any]]:
+    """
+    GET /people/{id}/contracts
+
+    Obtiene todos los contratos de una persona en Runn.
+    En Runn, cada persona puede tener múltiples contratos
+    (e.g., diferentes periodos, cambios de rol).
+
+    Args:
+        person_id: ID de la persona en Runn
+
+    Returns:
+        Lista de contratos con id, startDate, endDate, roleId, costPerHour, etc.
+    """
+    _RATE_LIMITER.wait_if_needed()
+
+    url = f"{RUNN_BASE_URL}/people/{person_id}/contracts"
+
+    try:
+        resp = requests.get(url, headers=_runn_headers(), timeout=60)
+        if not resp.ok:
+            logger.error(
+                f"Failed to fetch contracts for person {person_id}: {resp.status_code}"
+            )
+            return []
+
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.exception(f"Exception fetching contracts for person {person_id}: {e}")
+        return []
+
+
+def runn_get_active_contracts(
+    person_id: int,
+    reference_date: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Obtiene contratos activos de una persona en una fecha específica.
+
+    Un contrato es activo si:
+    - startDate <= reference_date (o hoy)
+    - endDate >= reference_date (o hoy) O endDate is None
+
+    Args:
+        person_id: ID de persona en Runn
+        reference_date: Fecha de referencia YYYY-MM-DD (default: hoy)
+
+    Returns:
+        Lista de contratos activos
+    """
+    import datetime as dt
+
+    contracts = runn_get_person_contracts(person_id)
+
+    if not contracts:
+        return []
+
+    # Fecha de referencia (hoy si no se especifica)
+    if reference_date:
+        ref = reference_date
+    else:
+        ref = dt.date.today().isoformat()
+
+    active = []
+    for contract in contracts:
+        start = contract.get("startDate", "")
+        end = contract.get("endDate")
+
+        # Debe haber comenzado antes o en la fecha de referencia
+        if start > ref:
+            continue
+
+        # Si tiene endDate, debe ser posterior o igual a la fecha de referencia
+        # Si no tiene endDate, está abierto (activo)
+        if end is None or end >= ref:
+            active.append(contract)
+
+    return active
+
+
+def runn_update_contract_cost(
+    contract_id: int,
+    cost_per_hour: float
+) -> Optional[Dict[str, Any]]:
+    """
+    PATCH /contracts/{id}
+
+    Actualiza el costPerHour de un contrato en Runn v1.0.
+
+    Args:
+        contract_id: ID del contrato en Runn
+        cost_per_hour: Costo por hora (calculado desde ChartHop)
+
+    Returns:
+        Contrato actualizado o None si falla
+    """
+    _RATE_LIMITER.wait_if_needed()
+
+    url = f"{RUNN_BASE_URL}/contracts/{contract_id}"
+
+    # Redondear a 2 decimales para evitar diferencias de precisión
+    cost_rounded = round(cost_per_hour, 2)
+
+    payload = {
+        "costPerHour": cost_rounded
+    }
+
+    try:
+        resp = requests.patch(url, headers=_runn_headers(), json=payload, timeout=60)
+        if resp.status_code in (200, 201):
+            result = resp.json()
+            logger.info(
+                f"Contract {contract_id} cost updated to {cost_rounded}/hour"
+            )
+            return result
+
+        logger.error(
+            f"runn_update_contract_cost failed [{resp.status_code}] {url}\n"
+            f"Payload: {payload}\n"
+            f"Response: {resp.text}"
+        )
+        return None
+    except Exception as e:
+        logger.exception(f"runn_update_contract_cost exception: {e}")
+        return None

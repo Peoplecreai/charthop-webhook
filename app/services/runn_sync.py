@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from app.clients.charthop import (
@@ -671,3 +672,397 @@ def delete_runn_timeoff_event(timeoff_id: str) -> Dict[str, Any]:
             "timeoff_id": timeoff_id,
             "runn_timeoff_id": runn_id
         }
+
+
+# -------------------------
+# Compensación / Cost Per Hour
+# -------------------------
+
+# Horas efectivas anuales trabajadas (configurable via env)
+ANNUAL_EFFECTIVE_HOURS = float(os.getenv("ANNUAL_EFFECTIVE_HOURS", "1856"))
+
+
+def _calculate_cost_per_hour(cost_to_company: float) -> float:
+    """
+    Calcula el costo por hora dado el CosttoCompany anualizado.
+
+    Formula: costPerHour = CosttoCompany / ANNUAL_EFFECTIVE_HOURS
+
+    Args:
+        cost_to_company: Costo anual total (CosttoCompany de ChartHop)
+
+    Returns:
+        Costo por hora redondeado a 2 decimales
+    """
+    if cost_to_company <= 0:
+        return 0.0
+
+    cost_per_hour = cost_to_company / ANNUAL_EFFECTIVE_HOURS
+    return round(cost_per_hour, 2)
+
+
+def sync_runn_compensation_event(person_id: str) -> Dict[str, Any]:
+    """
+    Sincroniza la compensación de una persona desde ChartHop a Runn.
+
+    Proceso:
+    1. Obtener CosttoCompany de ChartHop
+    2. Calcular costPerHour = CosttoCompany / 1,856
+    3. Buscar persona en Runn por email
+    4. Obtener contratos activos
+    5. Actualizar costPerHour en cada contrato activo
+
+    Args:
+        person_id: ID de la persona en ChartHop
+
+    Returns:
+        {
+            "status": "synced" | "skipped" | "error",
+            "person_id": "abc123",
+            "email": "user@example.com",
+            "cost_to_company": 100000.0,
+            "cost_per_hour": 53.88,
+            "contracts_updated": 2,
+            "runn_person_id": 456
+        }
+    """
+    from app.clients.charthop import ch_get_person_compensation
+    from app.clients.runn import (
+        runn_find_person_by_email,
+        runn_get_active_contracts,
+        runn_update_contract_cost,
+    )
+
+    metrics = get_sync_metrics()
+
+    person_id = (person_id or "").strip()
+    if not person_id:
+        error_result = {"status": "error", "reason": "missing person_id"}
+        metrics.increment_counter("compensation_errors")
+        metrics.record_error(
+            error_type="compensation",
+            error_message="missing person_id"
+        )
+        return error_result
+
+    # 1. Obtener compensación de ChartHop
+    comp_data = ch_get_person_compensation(person_id)
+
+    if not comp_data:
+        skip_result = {
+            "status": "skipped",
+            "reason": "person not found in ChartHop",
+            "person_id": person_id
+        }
+        metrics.increment_counter("compensation_skipped")
+        return skip_result
+
+    email = comp_data.get("email", "")
+    cost_to_company = comp_data.get("cost_to_company")
+
+    if not email:
+        skip_result = {
+            "status": "skipped",
+            "reason": "missing email",
+            "person_id": person_id
+        }
+        metrics.increment_counter("compensation_skipped")
+        return skip_result
+
+    if cost_to_company is None or cost_to_company <= 0:
+        skip_result = {
+            "status": "skipped",
+            "reason": "missing or invalid cost to company",
+            "person_id": person_id,
+            "email": email
+        }
+        metrics.increment_counter("compensation_skipped")
+        return skip_result
+
+    # 2. Calcular cost per hour
+    cost_per_hour = _calculate_cost_per_hour(cost_to_company)
+
+    if cost_per_hour <= 0:
+        skip_result = {
+            "status": "skipped",
+            "reason": "calculated cost per hour is invalid",
+            "person_id": person_id,
+            "email": email,
+            "cost_to_company": cost_to_company
+        }
+        metrics.increment_counter("compensation_skipped")
+        return skip_result
+
+    # 3. Buscar persona en Runn
+    runn_person = runn_find_person_by_email(email)
+
+    if not runn_person or not runn_person.get("id"):
+        skip_result = {
+            "status": "skipped",
+            "reason": "person not found in Runn",
+            "person_id": person_id,
+            "email": email
+        }
+        metrics.increment_counter("compensation_skipped")
+        return skip_result
+
+    runn_person_id = int(runn_person["id"])
+
+    # 4. Obtener contratos activos
+    active_contracts = runn_get_active_contracts(runn_person_id)
+
+    if not active_contracts:
+        skip_result = {
+            "status": "skipped",
+            "reason": "no active contracts",
+            "person_id": person_id,
+            "email": email,
+            "runn_person_id": runn_person_id
+        }
+        metrics.increment_counter("compensation_skipped")
+        return skip_result
+
+    # 5. Actualizar cada contrato activo
+    contracts_updated = 0
+    contracts_failed = 0
+
+    for contract in active_contracts:
+        contract_id = contract.get("id")
+        if not contract_id:
+            continue
+
+        # Verificar si ya tiene el mismo costo (evitar updates innecesarios)
+        current_cost = contract.get("costPerHour")
+        if current_cost is not None:
+            current_cost = round(float(current_cost), 2)
+            if current_cost == cost_per_hour:
+                logger.info(
+                    f"Contract {contract_id} already has cost {cost_per_hour}/hour, skipping"
+                )
+                continue
+
+        result = runn_update_contract_cost(contract_id, cost_per_hour)
+
+        if result:
+            contracts_updated += 1
+            metrics.increment_counter("contracts_updated")
+        else:
+            contracts_failed += 1
+
+    # Determinar status final
+    if contracts_updated > 0:
+        status = "synced"
+        metrics.increment_counter("compensation_synced")
+    elif contracts_failed > 0:
+        status = "error"
+        metrics.increment_counter("compensation_errors")
+        metrics.record_error(
+            error_type="compensation",
+            error_message=f"failed to update {contracts_failed} contracts",
+            entity_id=person_id
+        )
+    else:
+        status = "skipped"
+        metrics.increment_counter("compensation_skipped")
+
+    metrics.record_sync("compensation_event")
+
+    return {
+        "status": status,
+        "person_id": person_id,
+        "email": email,
+        "name": comp_data.get("name"),
+        "cost_to_company": cost_to_company,
+        "currency": comp_data.get("currency", "USD"),
+        "cost_per_hour": cost_per_hour,
+        "runn_person_id": runn_person_id,
+        "contracts_updated": contracts_updated,
+        "contracts_failed": contracts_failed,
+        "total_active_contracts": len(active_contracts),
+    }
+
+
+def sync_runn_compensation(reference: dt.date | None = None) -> Dict[str, Any]:
+    """
+    Sincronización batch de compensaciones.
+
+    Procesa todas las personas activas en ChartHop con compensación
+    y actualiza sus contratos activos en Runn.
+
+    Args:
+        reference: Fecha de referencia para determinar contratos activos (default: hoy)
+
+    Returns:
+        {
+            "processed": 150,
+            "synced": 145,
+            "skipped": 3,
+            "error": 2,
+            "total_contracts_updated": 200,
+            "results": [...]
+        }
+    """
+    from app.clients.charthop import ch_fetch_people_with_compensation
+    from app.clients.runn import (
+        runn_find_person_by_email,
+        runn_get_active_contracts,
+        runn_update_contract_cost,
+    )
+
+    metrics = get_sync_metrics()
+    reference = reference or dt.date.today()
+    reference_str = reference.isoformat()
+
+    # Obtener todas las personas con compensación de ChartHop
+    people = ch_fetch_people_with_compensation(active_only=True)
+
+    results: List[Dict[str, Any]] = []
+    total_contracts_updated = 0
+
+    for person_data in people:
+        person_id = person_data.get("person_id", "")
+        email = person_data.get("email", "")
+        cost_to_company = person_data.get("cost_to_company")
+
+        if not email:
+            results.append({
+                "person_id": person_id,
+                "status": "skipped",
+                "reason": "missing email"
+            })
+            continue
+
+        if cost_to_company is None or cost_to_company <= 0:
+            results.append({
+                "person_id": person_id,
+                "email": email,
+                "status": "skipped",
+                "reason": "missing or invalid cost to company"
+            })
+            continue
+
+        # Calcular cost per hour
+        cost_per_hour = _calculate_cost_per_hour(cost_to_company)
+
+        if cost_per_hour <= 0:
+            results.append({
+                "person_id": person_id,
+                "email": email,
+                "status": "skipped",
+                "reason": "invalid cost per hour"
+            })
+            continue
+
+        # Buscar en Runn
+        runn_person = runn_find_person_by_email(email)
+
+        if not runn_person:
+            results.append({
+                "person_id": person_id,
+                "email": email,
+                "status": "skipped",
+                "reason": "person not found in Runn"
+            })
+            continue
+
+        runn_person_id = int(runn_person["id"])
+
+        # Obtener contratos activos
+        active_contracts = runn_get_active_contracts(
+            runn_person_id,
+            reference_date=reference_str
+        )
+
+        if not active_contracts:
+            results.append({
+                "person_id": person_id,
+                "email": email,
+                "runn_person_id": runn_person_id,
+                "status": "skipped",
+                "reason": "no active contracts"
+            })
+            continue
+
+        # Actualizar contratos
+        contracts_updated = 0
+        contracts_failed = 0
+
+        for contract in active_contracts:
+            contract_id = contract.get("id")
+            if not contract_id:
+                continue
+
+            # Verificar si ya tiene el mismo costo
+            current_cost = contract.get("costPerHour")
+            if current_cost is not None:
+                current_cost = round(float(current_cost), 2)
+                if current_cost == cost_per_hour:
+                    continue
+
+            result = runn_update_contract_cost(contract_id, cost_per_hour)
+
+            if result:
+                contracts_updated += 1
+            else:
+                contracts_failed += 1
+
+        total_contracts_updated += contracts_updated
+
+        # Status
+        if contracts_updated > 0:
+            status = "synced"
+        elif contracts_failed > 0:
+            status = "error"
+        else:
+            status = "skipped"
+
+        results.append({
+            "person_id": person_id,
+            "email": email,
+            "name": person_data.get("name"),
+            "status": status,
+            "cost_to_company": cost_to_company,
+            "cost_per_hour": cost_per_hour,
+            "runn_person_id": runn_person_id,
+            "contracts_updated": contracts_updated,
+            "contracts_failed": contracts_failed,
+        })
+
+    summary = {
+        "processed": len(people),
+        "synced": sum(1 for r in results if r.get("status") == "synced"),
+        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+        "error": sum(1 for r in results if r.get("status") == "error"),
+        "total_contracts_updated": total_contracts_updated,
+        "reference_date": reference_str,
+        "results": results,
+    }
+
+    # Actualizar métricas
+    metrics.increment_counter("compensation_synced", summary["synced"])
+    metrics.increment_counter("compensation_skipped", summary["skipped"])
+    metrics.increment_counter("compensation_errors", summary["error"])
+    metrics.increment_counter("contracts_updated", total_contracts_updated)
+    metrics.record_sync("compensation_batch")
+
+    # Registrar errores
+    for result in results:
+        if result.get("status") == "error":
+            metrics.record_error(
+                error_type="compensation",
+                error_message=result.get("reason", "unknown error"),
+                entity_id=result.get("person_id")
+            )
+
+    logger.info(
+        "Runn compensation sync summary",
+        extra={
+            "processed": summary["processed"],
+            "synced": summary["synced"],
+            "skipped": summary["skipped"],
+            "error": summary["error"],
+            "contracts_updated": total_contracts_updated,
+        }
+    )
+
+    return summary
