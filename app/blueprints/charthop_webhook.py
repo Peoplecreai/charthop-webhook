@@ -54,6 +54,24 @@ def ch_webhook():
             return "", 500
         return "", 200
 
+    # Detectar cambios de compensación
+    is_compensation = (
+        (is_person and (is_create or is_update)) or
+        entity in ("compensation", "comp") or
+        type_entity in ("compensation", "comp")
+    )
+
+    # Si es un evento de persona con update, podría ser cambio de compensación
+    # También detectar eventos explícitos de compensación
+    if is_compensation and entity_id:
+        try:
+            task = enqueue_charthop_task("compensation", entity_id)
+            print(f"Queued ChartHop compensation task: {task}")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"Failed to enqueue compensation task: {exc}")
+            return "", 500
+        return "", 200
+
     if not is_job:
         return "", 200
 
