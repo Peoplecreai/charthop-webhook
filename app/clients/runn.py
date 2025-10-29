@@ -515,7 +515,17 @@ def runn_get_person_contracts(person_id: int) -> List[Dict[str, Any]]:
             return []
 
         data = resp.json()
-        return data if isinstance(data, list) else []
+
+        # Normalizar respuesta: puede ser lista directa o {"values": [...]}
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+
+        if isinstance(data, dict):
+            values = data.get("values")
+            if isinstance(values, list):
+                return [item for item in values if isinstance(item, dict)]
+
+        return []
     except Exception as e:
         logger.exception(f"Exception fetching contracts for person {person_id}: {e}")
         return []
