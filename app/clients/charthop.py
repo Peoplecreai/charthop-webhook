@@ -710,6 +710,38 @@ def ch_upsert_job_field(job_id: str, field_api_name: str, value: object) -> Dict
         session.close()
 
 
+def ch_update_job_ctc(job_id: str, new_ctc: float, currency: str = "USD") -> Dict:
+    """
+    Actualiza los campos nativos de compensación en un Job de ChartHop.
+    """
+    job_id = (job_id or "").strip()
+    if not job_id:
+        raise ValueError("job_id is required")
+
+    session = _new_session()
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+
+        # El payload para campos nativos como 'comp' es diferente
+        # al de 'fields' (campos personalizados).
+        payload = {
+            "comp": {
+                "costtocompany": round(new_ctc, 2),
+                "currency": currency,
+            }
+        }
+
+        resp = session.patch(url, json=payload, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            body = {}
+        return _extract_entity(body) or body
+    finally:
+        session.close()
+
+
 # =========================
 #   Teamtailor hires helpers
 # =========================
