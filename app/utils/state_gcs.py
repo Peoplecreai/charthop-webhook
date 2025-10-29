@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional
 from google.cloud import storage
 
 _BUCKET = os.environ.get("CA_STATE_BUCKET", "")
+_MISSING = object()
 
 def _client() -> storage.Client:
     return storage.Client()
@@ -44,30 +45,44 @@ def get_state(object_path: str) -> Optional[Any]:
         return None
 
 
-def save_state(object_path: str, data: Any) -> None:
+def save_state(object_path: Any, data: Any = _MISSING) -> None:
     """
     Guarda datos en GCS.
-    
+
     Args:
         object_path: Ruta del objeto en el bucket
         data: Datos a guardar (dict, list, o string)
     """
+    if data is _MISSING:
+        data = object_path
+        object_path = os.environ.get("CA_STATE_OBJECT", "culture-amp/state.json")
+    else:
+        object_path = str(object_path)
+
     if not _BUCKET:
         print(f"Warning: CA_STATE_BUCKET not set, cannot save state to {object_path}")
         return
-    
+
     try:
         cli = _client()
         bkt = cli.bucket(_BUCKET)
         blob = bkt.blob(object_path)
-        
+
         # Convertir a string si es necesario
         if isinstance(data, (dict, list)):
-            content = json.dumps(data, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            content = json.dumps(
+                data,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         else:
             content = str(data)
-        
-        blob.upload_from_string(content, content_type="application/json; charset=utf-8")
+
+        blob.upload_from_string(
+            content.encode("utf-8"),
+            content_type="application/json; charset=utf-8",
+        )
     except Exception as e:
         print(f"Error saving state to GCS ({object_path}): {e}")
 
