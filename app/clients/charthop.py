@@ -283,11 +283,58 @@ PEOPLE_COMPENSATION_FIELDS = ",".join([
     "name.first",
     "name.last",
     "name.full",
+    "address.country",
+    "comp.base",
     "comp.costtocompany",
     "comp.currency",
     "employmentType",
     "employment",
 ])
+
+
+def ch_get_job_compensation_fields(
+    job_id: str, session: Optional[Session] = None
+) -> Optional[Dict[str, Any]]:
+    """Fetch base compensation, currency, and employment info for a job."""
+
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return None
+
+    own = False
+    if session is None:
+        session = _new_session()
+        own = True
+
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        payload = _get_json(
+            session,
+            url,
+            {"fields": "comp.base,comp.currency,employment"},
+        ) or {}
+
+        # ChartHop responses sometimes flatten field names ("comp.base")
+        # and sometimes nest them under "comp". Handle both cases defensively.
+        comp_base = payload.get("comp.base")
+        comp_currency = payload.get("comp.currency")
+
+        comp_obj = payload.get("comp")
+        if comp_base is None and isinstance(comp_obj, dict):
+            comp_base = comp_obj.get("base")
+        if comp_currency is None and isinstance(comp_obj, dict):
+            comp_currency = comp_obj.get("currency")
+
+        employment = payload.get("employment")
+
+        return {
+            "base": comp_base,
+            "currency": comp_currency,
+            "employment": employment,
+        }
+    finally:
+        if own:
+            session.close()
 
 
 def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
@@ -350,6 +397,7 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
 
         cost_to_company: Optional[float] = None
         currency = "USD"
+        base_comp: Optional[float] = None
 
         if ctc_money:
             amount = ctc_money.get("amount")
@@ -359,6 +407,38 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
                 except (ValueError, TypeError):
                     cost_to_company = None
             currency = (ctc_money.get("currency") or "USD").strip() or "USD"
+
+        # Obtener datos adicionales del Job (Base, Currency, Employment)
+        job_comp_fields = (
+            ch_get_job_compensation_fields(job_id, session=session)
+            if job_id
+            else None
+        )
+        if isinstance(job_comp_fields, dict):
+            base_raw = job_comp_fields.get("base")
+            if base_raw is None:
+                base_raw = payload.get("comp.base")
+            try:
+                if base_raw is not None:
+                    base_comp = float(base_raw)
+            except (ValueError, TypeError):
+                base_comp = None
+
+            job_currency = job_comp_fields.get("currency")
+            if job_currency:
+                currency = str(job_currency).strip() or currency
+
+            employment_override = job_comp_fields.get("employment")
+            if employment_override:
+                payload.setdefault("employment", employment_override)
+
+        if base_comp is None:
+            base_raw = payload.get("comp.base")
+            try:
+                if base_raw is not None:
+                    base_comp = float(base_raw)
+            except (ValueError, TypeError):
+                base_comp = None
 
         # Fallback a los campos legacy si el Job no expone CTC
         if cost_to_company is None:
@@ -378,6 +458,8 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
             "employee"
         ).strip()
 
+        country = (payload.get("address.country") or "").strip().upper()
+
         return {
             "person_id": person_id,
             "email": email,
@@ -386,6 +468,8 @@ def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
             "cost_to_company": cost_to_company,
             "currency": currency or "USD",
             "employment_type": employment_type,
+            "base_comp": base_comp,
+            "country": country,
         }
 
     except HTTPError as exc:
