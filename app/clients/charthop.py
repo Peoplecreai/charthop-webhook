@@ -8,7 +8,7 @@ import os
 import time
 import datetime as dt
 from collections import OrderedDict
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from requests import Session
 from requests.adapters import HTTPAdapter
@@ -195,6 +195,182 @@ def ch_get_job_employment(job_id: str, session: Optional[Session] = None) -> Opt
     finally:
         if own:
             session.close()
+
+
+PEOPLE_COMPENSATION_FIELDS = ",".join([
+    "id",
+    "contact.workEmail",
+    "contact.personalEmail",
+    "name.first",
+    "name.last",
+    "name.full",
+    "comp.costtocompany",
+    "comp.currency",
+    "employmentType",
+    "employment",
+])
+
+
+def ch_get_person_compensation(person_id: str) -> Optional[Dict[str, Any]]:
+    """
+    GET /v2/org/{orgId}/person/{personId}
+
+    Obtiene información de compensación de una persona.
+
+    Args:
+        person_id: ID de la persona en ChartHop
+
+    Returns:
+        {
+            "person_id": "abc123",
+            "email": "user@example.com",
+            "name": "John Doe",
+            "cost_to_company": 100000.0,
+            "currency": "USD",
+            "employment_type": "employee"
+        }
+        o None si no se encuentra o falla
+    """
+    person_id = (person_id or "").strip()
+    if not person_id:
+        return None
+
+    session = _new_session()
+    try:
+        url = f"{CH_API}/v2/org/{CH_ORG_ID}/person/{person_id}"
+        payload = _get_json(
+            session,
+            url,
+            {"fields": PEOPLE_COMPENSATION_FIELDS}
+        )
+
+        if not payload:
+            return None
+
+        # Extraer email (preferir work email)
+        work_email = (payload.get("contact.workEmail") or "").strip()
+        personal_email = (payload.get("contact.personalEmail") or "").strip()
+        email = work_email or personal_email
+
+        if not email:
+            return None
+
+        # Extraer nombre
+        name_full = (payload.get("name.full") or "").strip()
+        if not name_full:
+            first = (payload.get("name.first") or "").strip()
+            last = (payload.get("name.last") or "").strip()
+            name_full = f"{first} {last}".strip()
+
+        # Extraer compensación
+        cost_to_company = payload.get("comp.costtocompany")
+        if cost_to_company is not None:
+            try:
+                cost_to_company = float(cost_to_company)
+            except (ValueError, TypeError):
+                cost_to_company = None
+
+        currency = (payload.get("comp.currency") or "USD").strip()
+
+        # Employment type
+        employment_type = (
+            payload.get("employmentType") or
+            payload.get("employment") or
+            "employee"
+        ).strip()
+
+        return {
+            "person_id": person_id,
+            "email": email,
+            "name": name_full,
+            "cost_to_company": cost_to_company,
+            "currency": currency,
+            "employment_type": employment_type,
+        }
+
+    except HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            return None
+        raise
+    finally:
+        session.close()
+
+
+def ch_fetch_people_with_compensation(
+    active_only: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Itera sobre todas las personas y extrae información de compensación.
+
+    Args:
+        active_only: Solo personas activas (default: True)
+
+    Returns:
+        Lista de personas con compensación:
+        [
+            {
+                "person_id": "abc123",
+                "email": "user@example.com",
+                "name": "John Doe",
+                "cost_to_company": 100000.0,
+                "currency": "USD",
+                "employment_type": "employee"
+            },
+            ...
+        ]
+    """
+    results: List[Dict[str, Any]] = []
+
+    for person in ch_iter_people_v2(PEOPLE_COMPENSATION_FIELDS):
+        person_id = (person.get("id") or "").strip()
+        if not person_id:
+            continue
+
+        # Email
+        work_email = (person.get("contact.workEmail") or "").strip()
+        personal_email = (person.get("contact.personalEmail") or "").strip()
+        email = work_email or personal_email
+
+        if not email:
+            continue
+
+        # Nombre
+        name_full = (person.get("name.full") or "").strip()
+        if not name_full:
+            first = (person.get("name.first") or "").strip()
+            last = (person.get("name.last") or "").strip()
+            name_full = f"{first} {last}".strip()
+
+        # Compensación
+        cost_to_company = person.get("comp.costtocompany")
+        if cost_to_company is not None:
+            try:
+                cost_to_company = float(cost_to_company)
+            except (ValueError, TypeError):
+                cost_to_company = None
+
+        # Skip si no hay compensación y estamos filtrando
+        if active_only and cost_to_company is None:
+            continue
+
+        currency = (person.get("comp.currency") or "USD").strip()
+
+        employment_type = (
+            person.get("employmentType") or
+            person.get("employment") or
+            "employee"
+        ).strip()
+
+        results.append({
+            "person_id": person_id,
+            "email": email,
+            "name": name_full,
+            "cost_to_company": cost_to_company,
+            "currency": currency,
+            "employment_type": employment_type,
+        })
+
+    return results
 
 
 # =========================
