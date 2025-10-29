@@ -311,12 +311,30 @@ def ch_get_job_compensation_fields(
         payload = _get_json(
             session,
             url,
-            {"fields": "comp.base,comp.currency,employment"},
+            {"fields": "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,employment"},
         ) or {}
 
         # ChartHop responses sometimes flatten field names ("comp.base")
         # and sometimes nest them under "comp". Handle both cases defensively.
-        comp_base = payload.get("comp.base")
+        comp_base: Optional[Any] = None
+
+        base_comp_data = payload.get("baseComp")
+        if isinstance(base_comp_data, dict):
+            pay_data = base_comp_data.get("pay")
+            if isinstance(pay_data, dict):
+                comp_base = pay_data.get("asOrgCurrency")
+                if comp_base is None:
+                    comp_base = pay_data.get("amount")
+            elif isinstance(pay_data, (int, float, str)):
+                comp_base = pay_data
+        elif isinstance(base_comp_data, (int, float, str)):
+            comp_base = base_comp_data
+
+        if comp_base is None:
+            comp_base = payload.get("baseComp.pay.asOrgCurrency")
+        if comp_base is None:
+            comp_base = payload.get("comp.base")
+
         comp_currency = payload.get("comp.currency")
 
         comp_obj = payload.get("comp")
