@@ -314,7 +314,7 @@ def ch_get_job_compensation_fields(
             {
                 "fields": (
                     "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,"
-                    "employment,fields.esquemaDeContratacion"
+                    "employment,fields.esquemaDeContratacin"
                 )
             },
         ) or {}
@@ -351,9 +351,9 @@ def ch_get_job_compensation_fields(
         employment = payload.get("employment")
 
         job_fields = payload.get("fields") or {}
-        esquema_contratacion = job_fields.get("esquemaDeContratacion")
+        esquema_contratacion = job_fields.get("esquemaDeContratacin")
         if esquema_contratacion is None:
-            esquema_contratacion = payload.get("fields.esquemaDeContratacion")
+            esquema_contratacion = payload.get("fields.esquemaDeContratacin")
 
         return {
             "base": comp_base,
