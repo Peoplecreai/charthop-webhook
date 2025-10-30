@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import hashlib
+import logging
 import os
 import time
 import datetime as dt
@@ -26,11 +27,15 @@ HTTP_TIMEOUT = _config.HTTP_TIMEOUT
 ch_headers = _config.ch_headers
 strip_accents_and_non_alnum = _config.strip_accents_and_non_alnum
 
+ESQUEMA_FIELD_API = os.getenv("CH_JOB_SCHEME_FIELD_API", "esquemaDeContratacin")
+
 CTC_FIELD_CODES = [
     code.strip()
     for code in os.getenv("CH_JOB_CTC_CODES", "Costtocompany,CostToCompany").split(",")
     if code.strip()
 ]
+
+logger = logging.getLogger(__name__)
 
 # =========================
 #   HTTP helpers
@@ -295,7 +300,11 @@ PEOPLE_COMPENSATION_FIELDS = ",".join([
 def ch_get_job_compensation_fields(
     job_id: str, session: Optional[Session] = None
 ) -> Optional[Dict[str, Any]]:
-    """Fetch base compensation, currency, and employment info for a job."""
+    """Fetch base compensation, currency, and employment info for a job.
+
+    The custom field for esquema de contratación can be overridden through the
+    ``CH_JOB_SCHEME_FIELD_API`` environment variable.
+    """
 
     job_id = (job_id or "").strip()
     if not job_id:
@@ -314,7 +323,7 @@ def ch_get_job_compensation_fields(
             {
                 "fields": (
                     "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,"
-                    "employment,fields.esquemaDeContratacin"
+                    f"employment,{ESQUEMA_FIELD_API}"
                 )
             },
         ) or {}
@@ -351,9 +360,14 @@ def ch_get_job_compensation_fields(
         employment = payload.get("employment")
 
         job_fields = payload.get("fields") or {}
-        esquema_contratacion = job_fields.get("esquemaDeContratacin")
-        if esquema_contratacion is None:
-            esquema_contratacion = payload.get("fields.esquemaDeContratacin")
+        esquema_contratacion = (
+            payload.get(ESQUEMA_FIELD_API)
+            or job_fields.get(ESQUEMA_FIELD_API)
+            or payload.get(f"fields.{ESQUEMA_FIELD_API}")
+        )
+
+        if not esquema_contratacion:
+            logger.debug("Job %s without %s", job_id, ESQUEMA_FIELD_API)
 
         return {
             "base": comp_base,
@@ -789,7 +803,11 @@ def ch_find_job(job_id: str) -> Optional[Dict]:
     session = _new_session()
     try:
         url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
-        resp = session.get(url, params={"include": "fields"}, timeout=HTTP_TIMEOUT)
+        resp = session.get(
+            url,
+            params={"fields": f"employment,{ESQUEMA_FIELD_API}"},
+            timeout=HTTP_TIMEOUT,
+        )
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
