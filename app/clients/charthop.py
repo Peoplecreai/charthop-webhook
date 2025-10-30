@@ -318,7 +318,7 @@ def ch_get_job_compensation_fields(
     try:
         url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
         fields_param = (
-            "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,"
+            "baseComp,baseComp.annualized,baseComp.annualized.asOrgCurrency,comp.currency,"
             "employment,esquemaDeContratacin,fields.esquemaDeContratacin"
         )
         if ESQUEMA_FIELD_API not in {
@@ -343,18 +343,18 @@ def ch_get_job_compensation_fields(
 
         base_comp_data = payload.get("baseComp")
         if isinstance(base_comp_data, dict):
-            pay_data = base_comp_data.get("pay")
-            if isinstance(pay_data, dict):
-                comp_base_raw = pay_data.get("asOrgCurrency")
+            annualized_data = base_comp_data.get("annualized")
+            if isinstance(annualized_data, dict):
+                comp_base_raw = annualized_data.get("asOrgCurrency")
                 if comp_base_raw is None:
-                    comp_base_raw = pay_data.get("amount")
-            elif isinstance(pay_data, (int, float, str)):
-                comp_base_raw = pay_data
+                    comp_base_raw = annualized_data.get("amount")
+            elif isinstance(annualized_data, (int, float, str)):
+                comp_base_raw = annualized_data
         elif isinstance(base_comp_data, (int, float, str)):
             comp_base_raw = base_comp_data
 
         if comp_base_raw is None:
-            comp_base_raw = payload.get("baseComp.pay.asOrgCurrency")
+            comp_base_raw = payload.get("baseComp.annualized.asOrgCurrency")
         if comp_base_raw is None:
             comp_base_raw = payload.get("comp.base")
 
