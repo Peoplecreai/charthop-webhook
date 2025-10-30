@@ -339,32 +339,48 @@ def ch_get_job_compensation_fields(
 
         # ChartHop responses sometimes flatten field names ("comp.base")
         # and sometimes nest them under "comp". Handle both cases defensively.
-        comp_base: Optional[Any] = None
+        comp_base_raw: Optional[Any] = None
 
         base_comp_data = payload.get("baseComp")
         if isinstance(base_comp_data, dict):
             pay_data = base_comp_data.get("pay")
             if isinstance(pay_data, dict):
-                comp_base = pay_data.get("asOrgCurrency")
-                if comp_base is None:
-                    comp_base = pay_data.get("amount")
+                comp_base_raw = pay_data.get("asOrgCurrency")
+                if comp_base_raw is None:
+                    comp_base_raw = pay_data.get("amount")
             elif isinstance(pay_data, (int, float, str)):
-                comp_base = pay_data
+                comp_base_raw = pay_data
         elif isinstance(base_comp_data, (int, float, str)):
-            comp_base = base_comp_data
+            comp_base_raw = base_comp_data
 
-        if comp_base is None:
-            comp_base = payload.get("baseComp.pay.asOrgCurrency")
-        if comp_base is None:
-            comp_base = payload.get("comp.base")
+        if comp_base_raw is None:
+            comp_base_raw = payload.get("baseComp.pay.asOrgCurrency")
+        if comp_base_raw is None:
+            comp_base_raw = payload.get("comp.base")
 
         comp_currency = payload.get("comp.currency")
 
         comp_obj = payload.get("comp")
-        if comp_base is None and isinstance(comp_obj, dict):
-            comp_base = comp_obj.get("base")
+        if comp_base_raw is None and isinstance(comp_obj, dict):
+            comp_base_raw = comp_obj.get("base")
         if comp_currency is None and isinstance(comp_obj, dict):
             comp_currency = comp_obj.get("currency")
+
+        # Normalize base: extract amount from money object if needed
+        comp_base: Optional[float] = None
+        if isinstance(comp_base_raw, dict):
+            # Money object: {"currency":"USD","amount":108000.0,"places":0}
+            amount = comp_base_raw.get("amount")
+            if amount is not None:
+                try:
+                    comp_base = float(amount)
+                except (ValueError, TypeError):
+                    comp_base = None
+        elif comp_base_raw is not None:
+            try:
+                comp_base = float(comp_base_raw)
+            except (ValueError, TypeError):
+                comp_base = None
 
         employment = payload.get("employment")
 
@@ -378,8 +394,17 @@ def ch_get_job_compensation_fields(
             or payload.get(f"fields.{ESQUEMA_FIELD_API}")
         )
 
+        # Normalize esquema: if it's a list, take the first element
+        if isinstance(esquema_contratacion, list) and esquema_contratacion:
+            esquema_contratacion = esquema_contratacion[0]
+
+        # Ensure esquema is a string or None
+        if esquema_contratacion and not isinstance(esquema_contratacion, str):
+            esquema_contratacion = str(esquema_contratacion)
+
         if not esquema_contratacion:
             logger.debug("Job %s without %s", job_id, ESQUEMA_FIELD_API)
+            esquema_contratacion = None
 
         return {
             "base": comp_base,
