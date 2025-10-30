@@ -95,11 +95,16 @@ The `ch_get_job_compensation_fields` function existed in `app/clients/charthop.p
 ### Fix Applied
 
 1. **Updated `app/clients/__init__.py`**: Added explicit imports and `__all__` declaration to properly export the function
+
 2. **Enhanced `ch_get_job_compensation_fields`**:
+   - **CRITICAL**: Changed to use ONLY `baseComp.annualized.asOrgCurrency` as the single source of truth for base compensation
+     - This ensures we always get the annualized amount (not monthly)
+     - Prevents incorrect CTC calculations from monthly values
    - Added logic to extract `amount` from money objects (`{"currency":"USD","amount":108000.0}`)
    - Added normalization to handle list values for esquema field (takes first element)
    - Added type conversion and validation for both base and esquema fields
+   - Removed all fallback paths to monthly/pay fields to ensure data consistency
 
 3. **Created verification script**: `tools/check_job_comp.py` for easy testing and CTC calculation
 
-These changes ensure the function can be imported and returns properly normalized data for downstream consumption.
+**Important**: The function now exclusively uses `baseComp.annualized.asOrgCurrency` to ensure the base is always annualized. This prevents calculation errors when the job has monthly compensation configured. The CTC calculation formula assumes annualized values.

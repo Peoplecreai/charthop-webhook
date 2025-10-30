@@ -317,8 +317,9 @@ def ch_get_job_compensation_fields(
 
     try:
         url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        # Request ONLY the annualized base comp field (NOT monthly/pay fields)
         fields_param = (
-            "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,"
+            "baseComp.annualized.asOrgCurrency,comp.currency,"
             "employment,esquemaDeContratacin,fields.esquemaDeContratacin"
         )
         if ESQUEMA_FIELD_API not in {
@@ -337,34 +338,27 @@ def ch_get_job_compensation_fields(
             {"fields": fields_param},
         ) or {}
 
-        # ChartHop responses sometimes flatten field names ("comp.base")
-        # and sometimes nest them under "comp". Handle both cases defensively.
+        # Extract ONLY annualized base from baseComp.annualized.asOrgCurrency
+        # This is the single source of truth for annualized compensation
         comp_base_raw: Optional[Any] = None
 
-        base_comp_data = payload.get("baseComp")
-        if isinstance(base_comp_data, dict):
-            pay_data = base_comp_data.get("pay")
-            if isinstance(pay_data, dict):
-                comp_base_raw = pay_data.get("asOrgCurrency")
-                if comp_base_raw is None:
-                    comp_base_raw = pay_data.get("amount")
-            elif isinstance(pay_data, (int, float, str)):
-                comp_base_raw = pay_data
-        elif isinstance(base_comp_data, (int, float, str)):
-            comp_base_raw = base_comp_data
+        # Try flattened response format first
+        comp_base_raw = payload.get("baseComp.annualized.asOrgCurrency")
 
+        # If not found, try nested structure
         if comp_base_raw is None:
-            comp_base_raw = payload.get("baseComp.pay.asOrgCurrency")
-        if comp_base_raw is None:
-            comp_base_raw = payload.get("comp.base")
+            base_comp_data = payload.get("baseComp")
+            if isinstance(base_comp_data, dict):
+                annualized_data = base_comp_data.get("annualized")
+                if isinstance(annualized_data, dict):
+                    comp_base_raw = annualized_data.get("asOrgCurrency")
 
+        # Extract currency
         comp_currency = payload.get("comp.currency")
-
-        comp_obj = payload.get("comp")
-        if comp_base_raw is None and isinstance(comp_obj, dict):
-            comp_base_raw = comp_obj.get("base")
-        if comp_currency is None and isinstance(comp_obj, dict):
-            comp_currency = comp_obj.get("currency")
+        if comp_currency is None:
+            comp_obj = payload.get("comp")
+            if isinstance(comp_obj, dict):
+                comp_currency = comp_obj.get("currency")
 
         # Normalize base: extract amount from money object if needed
         comp_base: Optional[float] = None
