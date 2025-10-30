@@ -83,8 +83,9 @@ def calculate_and_update_ch_ctc(person_id: str) -> Dict[str, Any]:
 
     try:
         # 3. Escribir de vuelta en ChartHop
-        ch_update_job_ctc(job_id, new_ctc, currency)
-        
+        # El CTC siempre debe estar en USD, independientemente de la moneda del base
+        ch_update_job_ctc(job_id, new_ctc, "USD")
+
         metrics.increment_counter("ctc_calc_updated")
         metrics.record_sync("ctc_calc_event")
         
