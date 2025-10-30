@@ -317,15 +317,24 @@ def ch_get_job_compensation_fields(
 
     try:
         url = f"{CH_API}/v2/org/{CH_ORG_ID}/job/{job_id}"
+        fields_param = (
+            "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,"
+            "employment,esquemaDeContratacin,fields.esquemaDeContratacin"
+        )
+        if ESQUEMA_FIELD_API not in {
+            "esquemaDeContratacin",
+            "fields.esquemaDeContratacin",
+        }:
+            fields_param = (
+                f"{fields_param},{ESQUEMA_FIELD_API}"
+                if ESQUEMA_FIELD_API.startswith("fields.")
+                else f"{fields_param},{ESQUEMA_FIELD_API},fields.{ESQUEMA_FIELD_API}"
+            )
+
         payload = _get_json(
             session,
             url,
-            {
-                "fields": (
-                    "baseComp,baseComp.pay,baseComp.pay.asOrgCurrency,comp.currency,"
-                    f"employment,{ESQUEMA_FIELD_API}"
-                )
-            },
+            {"fields": fields_param},
         ) or {}
 
         # ChartHop responses sometimes flatten field names ("comp.base")
@@ -361,7 +370,10 @@ def ch_get_job_compensation_fields(
 
         job_fields = payload.get("fields") or {}
         esquema_contratacion = (
-            payload.get(ESQUEMA_FIELD_API)
+            payload.get("esquemaDeContratacin")
+            or job_fields.get("esquemaDeContratacin")
+            or payload.get("fields.esquemaDeContratacin")
+            or payload.get(ESQUEMA_FIELD_API)
             or job_fields.get(ESQUEMA_FIELD_API)
             or payload.get(f"fields.{ESQUEMA_FIELD_API}")
         )
