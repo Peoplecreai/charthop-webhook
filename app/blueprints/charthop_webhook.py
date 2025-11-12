@@ -5,6 +5,26 @@ from app.tasks.charthop_dispatcher import enqueue_charthop_task
 
 bp_ch = Blueprint("charthop_webhook", __name__)
 
+@bp_ch.route("/events/talent-search", methods=["GET", "POST"])
+def ch_talent_search_webhook():
+    """Handle ChartHop talent-search webhook events."""
+    if request.method == "GET":
+        return "ChartHop talent-search webhook up", 200
+
+    evt = request.get_json(force=True, silent=True) or {}
+    evtype_raw = (evt.get("type") or evt.get("eventType") or evt.get("event_type") or "").lower()
+    entity = (evt.get("entityType") or evt.get("entitytype") or evt.get("entity_type") or "").lower()
+    entity_id = str(evt.get("entityId") or evt.get("entityid") or evt.get("entity_id") or "")
+
+    print(f"CH talent-search evt: type={evtype_raw} entity={entity} entity_id={entity_id}")
+
+    # Log the full event for debugging
+    print(f"Talent-search event payload: {evt}")
+
+    # Return 200 to acknowledge receipt
+    return "", 200
+
+
 @bp_ch.route("/webhooks/charthop", methods=["GET", "POST"])
 def ch_webhook():
     if request.method == "GET":
