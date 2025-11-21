@@ -17,31 +17,22 @@ def _calculate_ctc_from_formula(
     base_comp: float, esquema_contratacion: str
 ) -> float:
     """
-    Aplica la fórmula personalizada para calcular el Cost to Company.
+    Calcula el Cost to Company como: salario anual + fee según esquema.
     """
     if base_comp <= 0:
         return 0.0
 
     esquema = (esquema_contratacion or "").strip().lower()
 
-    # 1. Pension/Superannuation (USD)
-    pension = 0.0
+    # Fee según esquema de contratación (país)
+    fee = 0.0
     if esquema == "voiz":
-        pension = 240.0
+        fee = 240.0
     elif esquema == "ontop":
-        pension = 720.0
+        fee = 720.0
 
-    # 2. Healthcare (USD)
-    healthcare = 800.0
-
-    # 3. Continuing Education (USD)
-    education = 1000.0
-
-    # 4. Other Benefits (USD = Salary/24)
-    other_benefits = base_comp / 24.0
-
-    # 5. Calcular Total
-    total_ctc = base_comp + pension + healthcare + education + other_benefits
+    # CTC = Salario anual + Fee
+    total_ctc = base_comp + fee
     return round(total_ctc, 2)
 
 
