@@ -37,7 +37,7 @@ python3 tools/check_job_comp.py 670405b2c8e3d13247cfef5d
 #   "scheme": "Ontop",
 #   "currency": "USD",
 #   "employment": "CONTRACT",
-#   "ctc": 115020.0
+#   "ctc": 108720.0
 # }
 ```
 
@@ -46,19 +46,18 @@ python3 tools/check_job_comp.py 670405b2c8e3d13247cfef5d
 The `tools/check_job_comp.py` script calculates CTC (Cost to Company) using:
 
 ```
-CTC = base + pension + 800 + 1000 + (base / 24)
+CTC = base + fee
 ```
 
-Where pension is:
+Where fee is:
 - **720** if esquema == "Ontop"
 - **240** if esquema == "voiz" (case-insensitive)
 - **0** otherwise
 
 For example, with base=108000.0 and esquema="Ontop":
 ```
-CTC = 108000 + 720 + 800 + 1000 + (108000/24)
-CTC = 108000 + 720 + 800 + 1000 + 4500
-CTC = 115020.0
+CTC = 108000 + 720
+CTC = 108720.0
 ```
 
 ## Development

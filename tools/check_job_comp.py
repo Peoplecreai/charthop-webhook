@@ -22,9 +22,9 @@ def calculate_ctc(base: float, esquema: str) -> float:
     """
     Calculate CTC (Cost to Company) based on base compensation and hiring scheme.
 
-    Formula: CTC = base + pension + 800 + 1000 + base/24
+    Formula: CTC = base + fee
 
-    Where pension is:
+    Where fee is:
     - 720 if esquema == "Ontop"
     - 240 if esquema == "voiz" (case-insensitive)
     - 0 otherwise
@@ -42,16 +42,16 @@ def calculate_ctc(base: float, esquema: str) -> float:
     # Normalize esquema
     esquema_normalized = (esquema or "").strip().lower()
 
-    # Determine pension based on esquema
+    # Determine fee based on esquema
     if esquema_normalized == "ontop":
-        pension = 720
+        fee = 720
     elif esquema_normalized == "voiz":
-        pension = 240
+        fee = 240
     else:
-        pension = 0
+        fee = 0
 
     # Calculate CTC
-    ctc = base + pension + 800 + 1000 + (base / 24)
+    ctc = base + fee
 
     return round(ctc, 2)
 
