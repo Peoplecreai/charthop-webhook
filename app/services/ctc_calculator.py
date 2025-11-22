@@ -17,22 +17,36 @@ def _calculate_ctc_from_formula(
     base_comp: float, esquema_contratacion: str
 ) -> float:
     """
-    Calcula el Cost to Company como: salario anual + fee según esquema.
+    Calcula el Cost to Company según esquema de contratación:
+    - Nómina y Mixto Interno: base + 40% del base
+    - Mixto Externo: base + 40% de (2 salarios mínimos) + 2% del restante
     """
     if base_comp <= 0:
         return 0.0
 
     esquema = (esquema_contratacion or "").strip().lower()
 
-    # Fee según esquema de contratación (país)
-    fee = 0.0
-    if esquema == "voiz":
-        fee = 240.0
-    elif esquema == "ontop":
-        fee = 720.0
+    # Constantes para cálculo de Mixto Externo
+    SALARIO_MINIMO_MENSUAL_MXN = 8364.0
+    TIPO_CAMBIO_MXN_USD = 18.30
+    # Dos salarios mínimos anuales en USD: (8,364 * 12 * 2) / 18.30
+    DOS_SALARIOS_MINIMOS_ANUALES_USD = (SALARIO_MINIMO_MENSUAL_MXN * 12 * 2) / TIPO_CAMBIO_MXN_USD
 
-    # CTC = Salario anual + Fee
-    total_ctc = base_comp + fee
+    # Cálculo según esquema de contratación
+    if esquema in ["nómina", "nomina", "mixto interno"]:
+        # Nómina y Mixto Interno: base + 40% del base
+        total_ctc = base_comp * 1.40
+    elif esquema in ["mixto externo"]:
+        # Mixto Externo: base + 40% de (2 salarios mínimos) + 2% del restante
+        bonus_dos_salarios = DOS_SALARIOS_MINIMOS_ANUALES_USD * 0.40
+        restante = base_comp - DOS_SALARIOS_MINIMOS_ANUALES_USD
+        fee_restante = restante * 0.02
+        total_ctc = base_comp + bonus_dos_salarios + fee_restante
+    else:
+        # Si no coincide con ningún esquema conocido, devolver solo el base
+        logger.warning(f"Esquema de contratación no reconocido: '{esquema_contratacion}'. Usando solo base_comp.")
+        total_ctc = base_comp
+
     return round(total_ctc, 2)
 
 
