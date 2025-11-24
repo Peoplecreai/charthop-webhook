@@ -22,6 +22,11 @@ def _calculate_ctc_from_formula(
     - Mixto Externo: base + 40% de (2 salarios mínimos) + 2% del restante
     - Ontop: base + 720
     - Voiz: base + 240
+
+    Además se agregan los siguientes beneficios a todos los esquemas:
+    - Apoyo de salud: $800 USD anual
+    - Apoyo learning: $1000 USD anual
+    - Bono navideño: sueldo anual / 24
     """
     if base_comp <= 0:
         return 0.0
@@ -33,6 +38,11 @@ def _calculate_ctc_from_formula(
     TIPO_CAMBIO_MXN_USD = 18.30
     # Dos salarios mínimos anuales en USD: (8,364 * 12 * 2) / 18.30
     DOS_SALARIOS_MINIMOS_ANUALES_USD = (SALARIO_MINIMO_MENSUAL_MXN * 12 * 2) / TIPO_CAMBIO_MXN_USD
+
+    # Beneficios adicionales aplicables a todos los esquemas
+    APOYO_SALUD_ANUAL = 800.0
+    APOYO_LEARNING_ANUAL = 1000.0
+    bono_navideno = base_comp / 24.0
 
     # Cálculo según esquema de contratación
     if esquema in ["nómina", "nomina", "mixto interno"]:
@@ -54,6 +64,9 @@ def _calculate_ctc_from_formula(
         # Si no coincide con ningún esquema conocido, devolver solo el base
         logger.warning(f"Esquema de contratación no reconocido: '{esquema_contratacion}'. Usando solo base_comp.")
         total_ctc = base_comp
+
+    # Agregar beneficios adicionales a todos los esquemas
+    total_ctc = total_ctc + APOYO_SALUD_ANUAL + APOYO_LEARNING_ANUAL + bono_navideno
 
     return round(total_ctc, 2)
 

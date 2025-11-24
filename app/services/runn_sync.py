@@ -682,7 +682,7 @@ def delete_runn_timeoff_event(timeoff_id: str) -> Dict[str, Any]:
 RUNN_ANNUAL_HOURS = float(
     os.getenv(
         "RUNN_ANNUAL_HOURS",
-        os.getenv("ANNUAL_EFFECTIVE_HOURS", "1856"),
+        os.getenv("ANNUAL_EFFECTIVE_HOURS", "2080"),
     )
 )
 
