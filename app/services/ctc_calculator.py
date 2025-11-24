@@ -20,6 +20,8 @@ def _calculate_ctc_from_formula(
     Calcula el Cost to Company según esquema de contratación:
     - Nómina y Mixto Interno: base + 40% del base
     - Mixto Externo: base + 40% de (2 salarios mínimos) + 2% del restante
+    - Ontop: base + 720
+    - Voiz: base + 240
     """
     if base_comp <= 0:
         return 0.0
@@ -42,6 +44,12 @@ def _calculate_ctc_from_formula(
         restante = base_comp - DOS_SALARIOS_MINIMOS_ANUALES_USD
         fee_restante = restante * 0.02
         total_ctc = base_comp + bonus_dos_salarios + fee_restante
+    elif esquema == "ontop":
+        # Ontop: base + 720
+        total_ctc = base_comp + 720
+    elif esquema == "voiz":
+        # Voiz: base + 240
+        total_ctc = base_comp + 240
     else:
         # Si no coincide con ningún esquema conocido, devolver solo el base
         logger.warning(f"Esquema de contratación no reconocido: '{esquema_contratacion}'. Usando solo base_comp.")
