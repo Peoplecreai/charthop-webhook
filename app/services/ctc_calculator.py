@@ -20,6 +20,7 @@ def _calculate_ctc_from_formula(
     Calcula el Cost to Company según esquema de contratación:
     - Nómina y Mixto Interno: base + 40% del base
     - Mixto Externo: base + 40% de (2 salarios mínimos) + 2% del restante
+    - Softgic: base + 18% del base
     - Ontop: base + 720
     - Voiz: base + 240
 
@@ -54,6 +55,9 @@ def _calculate_ctc_from_formula(
         restante = base_comp - DOS_SALARIOS_MINIMOS_ANUALES_USD
         fee_restante = restante * 0.02
         total_ctc = base_comp + bonus_dos_salarios + fee_restante
+    elif esquema == "softgic":
+        # Softgic: base + 18% del base
+        total_ctc = base_comp * 1.18
     elif esquema == "ontop":
         # Ontop: base + 720
         total_ctc = base_comp + 720
